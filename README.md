@@ -29,7 +29,6 @@ This is a deliberately minimal system. The following features are absent by desi
 | FIFO ordering guarantees | Jobs are claimed in an approximate order but no strict ordering is enforced across workers. |
 | Fan-out / chaining | No built-in support for job DAGs or spawning child jobs. |
 | Rate limiting per job type | Workers claim up to a configured limit but there is no per-type throttle. |
-| Dead letter queue | Permanently failed jobs stay in the DB and are retried manually via the management API. |
 | Multi-tenant isolation | All workers share the same tables; logical separation is by namespace only. |
 
 ---
@@ -177,7 +176,7 @@ This view is used for debugging, not for claim logic.
 
 ### Dispatching a Job
 
-`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job and acquires the lease atomically in a single transaction, ensuring that a job is never visible to workers without a claimable lease. `Run()` dispatches the job locally and blocks until it completes.
+`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job row and an unlocked lease, then returns immediately — a worker will claim the lease and execute the job asynchronously. `Run()` creates the job, acquires the lease locally via `CreateAndAcquire`, creates the job attempt, and executes the handler in-process, blocking until completion.
 
 A top-level `System` struct composes both `Publisher` and `Worker`, promoting their methods for convenience.
 
@@ -193,7 +192,7 @@ type Publisher struct {
     leases leases.Store
 }
 
-// Dispatch creates the job and acquires the lease in a single transaction.
+// Dispatch creates the job and the lease, then returns immediately.
 // The job will be claimed and executed by a worker asynchronously.
 func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name, namespace string, req []byte) (*Job, error) {
     job := &Job{
@@ -211,50 +210,61 @@ func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name, namespace strin
         return nil, fmt.Errorf("insert job: %w", err)
     }
 
-    if _, err := p.leases.CreateAndAcquire(ctx, db, namespace, job.ID.String(), hostname, leaseDuration); err != nil {
+    // Create the lease (unlocked) so a worker can claim it asynchronously.
+    if _, err := p.leases.Create(ctx, db, namespace, job.ID.String()); err != nil {
+        return nil, fmt.Errorf("create lease: %w", err)
+    }
+
+    return job, err
+}
+
+// Run creates the job, acquires the lease locally, and executes the handler in-process.
+// It blocks until the job completes, returning the response.
+func (s *System) Run(ctx context.Context, db DBTX, name, namespace string, req []byte) ([]byte, error) {
+    job := &Job{
+        ID:        uuid.New(),
+        Name:      name,
+        Namespace: namespace,
+        Request:   req,
+    }
+
+    // 1. Create the job row.
+    _, err := db.ExecContext(ctx,
+        `INSERT INTO jobs (id, name, namespace, creator_sha, creator_host, request)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        job.ID, job.Name, job.Namespace, buildSHA, hostname, req,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("insert job: %w", err)
+    }
+
+    // 2. Create and acquire the lease so no other worker claims it.
+    if _, err := s.leases.CreateAndAcquire(ctx, db, namespace, job.ID.String(), hostname, leaseDuration); err != nil {
         return nil, fmt.Errorf("create and acquire lease: %w", err)
     }
 
+    // 3. Create the first job attempt.
+    attempt := &Attempt{JobID: job.ID, AttemptNo: 1}
     _, err = db.ExecContext(ctx,
         `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
          VALUES ($1, 1, $2, $3)`,
         job.ID, hostname, buildSHA,
     )
-    return job, err
-}
-
-// Run dispatches the job and blocks until it completes, returning the response.
-// It uses CreateAndAcquire to hold the lease locally, preventing other workers from claiming it.
-func (p *Publisher) Run(ctx context.Context, db DBTX, name, namespace string, req []byte) ([]byte, error) {
-    job, err := p.Dispatch(ctx, db, name, namespace, req)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("insert attempt: %w", err)
     }
-    // Poll until the job attempt has a finished_at timestamp.
-    for {
-        select {
-        case <-ctx.Done():
-            return nil, ctx.Err()
-        case <-time.After(pollInterval):
-        }
-        row := db.QueryRowContext(ctx,
-            `SELECT response, error FROM job_attempts
-             WHERE job_id = $1 AND finished_at IS NOT NULL
-             ORDER BY attempt_no DESC LIMIT 1`,
-            job.ID,
-        )
-        var resp []byte
-        var jobErr []byte
-        if err := row.Scan(&resp, &jobErr); err == sql.ErrNoRows {
-            continue
-        } else if err != nil {
-            return nil, err
-        }
-        if jobErr != nil {
-            return nil, fmt.Errorf("job failed: %s", jobErr)
-        }
-        return resp, nil
+
+    // 4. Execute the job locally via the Worker's handler registry.
+    resp, execErr := s.Worker.registry[name].Handle(ctx, req)
+    if execErr != nil {
+        _ = s.Worker.fail(ctx, db, job, attempt, execErr)
+        return nil, fmt.Errorf("job failed: %w", execErr)
     }
+
+    if err := s.Worker.complete(ctx, db, job, attempt, resp); err != nil {
+        return nil, fmt.Errorf("complete job: %w", err)
+    }
+    return resp, nil
 }
 ```
 
@@ -476,6 +486,7 @@ Locking is delegated entirely to the `leases` library. The job system does not o
 
 ```go
 type Store interface {
+    Create(ctx context.Context, db DBTX, group, resource string) (*Lease, error)
     CreateAndAcquire(ctx context.Context, db DBTX, group, resource, owner string, duration time.Duration) (*Lease, error)
     Delete(ctx context.Context, db DBTX, resource string) error
 
@@ -489,7 +500,8 @@ type Store interface {
 }
 ```
 
-- `CreateAndAcquire`: called during dispatch to atomically create and hold the lease, ensuring no race between creation and first claim.
+- `Create`: called during `Dispatch()` to create an unlocked lease for asynchronous worker claim.
+- `CreateAndAcquire`: called during `Run()` to atomically create and hold the lease locally, preventing other workers from claiming it.
 - `Delete`: called on job completion, permanent failure, or cancellation to remove the lease row entirely.
 - `AcquireMany`: called during the claim loop to grab available leases.
 - `Release`: called on transient failure so another worker can re-claim the job on the next poll.
