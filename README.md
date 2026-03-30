@@ -180,7 +180,9 @@ This view is used for debugging, not for claim logic.
 
 ### Dispatching a Job
 
-`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job row and an unlocked lease, then returns immediately — a worker will claim the lease and execute the job asynchronously. `Run()` creates the job, acquires the lease locally, and executes the handler in-process, blocking until completion.
+`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job row and, if no conflict is found, **prefers local execution**: it immediately acquires the lease and runs the handler in a goroutine, rather than creating an unlocked lease and waiting for a worker to claim it. If a conflict is found (same idempotency key), `Dispatch()` checks whether the existing job is actively running; if it is, it polls for the result and returns it. `Run()` does the same but blocks until completion.
+
+Preferring local execution in `Dispatch()` avoids a round-trip through the claim poll cycle: the dispatching process acts as both publisher and executor. Falling back to an unlocked lease (async worker claim) only occurs when local execution cannot proceed — for example, when a race prevents immediate lease acquisition.
 
 Namespace is a system-wide configuration (set on `Worker` / `System` at startup) and is not a per-call parameter.
 
@@ -197,6 +199,7 @@ type System struct {
 type Publisher struct {
     namespace string
     leases    leases.Store
+    worker    *Worker
 }
 ```
 
@@ -213,30 +216,68 @@ Every job row carries an `idempotency_key`. Its purpose is to prevent duplicate 
 **Signatures:**
 
 ```go
-// Dispatch creates the job row and an unlocked lease, then returns immediately.
-// idempotencyKey is optional; pass "" to auto-generate (opts out of deduplication).
-func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req []byte, idempotencyKey string) (*Job, error) {
+// Dispatch creates the job row and prefers to acquire the lease and run the handler
+// locally in a goroutine. If the job already exists and is actively running, Dispatch
+// polls job_status until the job reaches a terminal state and returns.
+// If the job exists but is not running (pending), Dispatch returns immediately and the
+// async worker claim path handles execution.
+// req must be a valid JSON-encoded payload.
+func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string) (*Job, error) {
     key := idempotencyKey
     if key == "" {
         key = uuid.NewString()
     }
 
     var job Job
+    var isNew bool
     err := db.QueryRowContext(ctx, `
         INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
-        RETURNING id, idempotency_key, name, namespace`,
+        RETURNING id, idempotency_key, name, namespace, (xmax = 0) AS inserted`,
         uuid.New(), key, name, p.namespace, buildSHA, hostname, req,
-    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace, &isNew)
     if err != nil {
         return nil, fmt.Errorf("insert job: %w", err)
     }
 
-    // leases.Create is a no-op if a lease already exists for this job.
-    if _, err := p.leases.Create(ctx, db, p.namespace, job.ID.String()); err != nil {
-        return nil, fmt.Errorf("create lease: %w", err)
+    if !isNew {
+        // Job already exists. Check whether it is actively running (lease is held).
+        acquired, err := p.leases.IsAcquired(ctx, db, job.ID.String())
+        if err != nil {
+            return nil, fmt.Errorf("check lease: %w", err)
+        }
+        if acquired {
+            // Another worker (or goroutine) is running this job — poll for result.
+            if err := p.pollForCompletion(ctx, db, job.ID); err != nil {
+                return nil, err
+            }
+        }
+        // Job is pending but not claimed — return immediately; async claim will handle it.
+        return &job, nil
     }
+
+    // Newly created job: prefer local execution. Attempt to acquire the lease immediately.
+    lease, err := p.leases.CreateAndAcquire(ctx, db, p.namespace, job.ID.String(), hostname, leaseDuration)
+    if err != nil {
+        // Could not acquire (e.g. race with another process). Fall back to unlocked lease
+        // so the async worker poll loop picks it up.
+        if _, createErr := p.leases.Create(ctx, db, p.namespace, job.ID.String()); createErr != nil {
+            return nil, fmt.Errorf("create lease: %w", createErr)
+        }
+        return &job, nil
+    }
+
+    // Lease acquired: insert the first attempt row and run the handler in a goroutine.
+    attempt := &Attempt{JobID: job.ID, AttemptNo: 1, LeaseToken: lease.Token}
+    if _, err = db.ExecContext(ctx,
+        `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
+         VALUES ($1, 1, $2, $3)`,
+        job.ID, hostname, buildSHA,
+    ); err != nil {
+        return nil, fmt.Errorf("insert attempt: %w", err)
+    }
+    go p.worker.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
 
     return &job, nil
 }
@@ -244,7 +285,8 @@ func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req []by
 // Run creates the job, acquires the lease locally, and executes the handler in-process.
 // idempotencyKey is required. If a job with this (name, key) already exists, Run polls
 // job_status until the job reaches a terminal state, then returns the result.
-func (s *System) Run(ctx context.Context, db DBTX, name string, req []byte, idempotencyKey string) ([]byte, error) {
+// req must be a valid JSON-encoded payload.
+func (s *System) Run(ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string) (json.RawMessage, error) {
     if idempotencyKey == "" {
         return nil, fmt.Errorf("Run: idempotencyKey is required")
     }
@@ -284,9 +326,37 @@ func (s *System) Run(ctx context.Context, db DBTX, name string, req []byte, idem
     return s.Worker.runWithRetry(ctx, db, &job, attempt)
 }
 
+// pollForCompletion polls job_status until the job reaches a terminal state.
+// Used by Dispatch() when a running duplicate is detected.
+func (p *Publisher) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUID) error {
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-ticker.C:
+            var status string
+            err := db.QueryRowContext(ctx,
+                `SELECT status FROM job_status WHERE job_id = $1`, jobID,
+            ).Scan(&status)
+            if err != nil {
+                return err
+            }
+            switch status {
+            case "complete":
+                return nil
+            case "failed", "cancelled":
+                return fmt.Errorf("job %s: %s", jobID, status)
+            }
+            // pending, running, pending_retry — keep polling
+        }
+    }
+}
+
 // pollForResult polls job_status until the job reaches a terminal state,
-// then fetches the response from job_attempts.
-func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) ([]byte, error) {
+// then fetches the response from job_attempts. Used by Run() for duplicate detection.
+func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (json.RawMessage, error) {
     ticker := time.NewTicker(500 * time.Millisecond)
     defer ticker.Stop()
     for {
@@ -303,7 +373,7 @@ func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) ([
             }
             switch status {
             case "complete":
-                var resp []byte
+                var resp json.RawMessage
                 err = db.QueryRowContext(ctx,
                     `SELECT response FROM job_attempts
                      WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1`,
@@ -468,7 +538,7 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
 ```go
 // complete must be called within a transaction so the response write and lease
 // deletion are atomic — a crash between them would leave the job in an inconsistent state.
-func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp []byte) error {
+func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -517,7 +587,7 @@ The worker retries failed jobs locally rather than releasing the lease and waiti
 // runWithRetry executes the job handler, retrying locally on transient failure.
 // The lease is held for the entire retry loop; it is deleted on success or
 // permanent failure, and released on context cancellation (graceful termination).
-func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) ([]byte, error) {
+func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) (json.RawMessage, error) {
     for {
         resp, execErr := w.registry[job.Name].Handle(ctx, attempt.Request)
         if execErr == nil {
@@ -591,17 +661,25 @@ if time.Now().Before(nextAllowedAt) {
 
 ## Serialization and Typed Job Contracts
 
-The job system's internal boundary is untyped: request and response payloads are `[]byte`. This keeps the infrastructure layer free of application-level types.
+**Invariant: all request and response payloads must be valid JSON.** This is enforced at every public interface boundary:
+
+- `Dispatch(req json.RawMessage, ...)` and `Run(req json.RawMessage, ...)` accept `json.RawMessage`, which is a named `[]byte` type that signals the JSON contract to callers. Passing non-JSON bytes is a programming error; the system validates the payload is non-nil and well-formed before inserting it.
+- Handlers registered via `JobFn` automatically produce valid JSON responses via `json.Marshal`. Custom `Handler` implementations that produce raw bytes must ensure their output is valid JSON — this is checked at registration time with a sentinel validation.
+- The `request` and `response` columns are typed `JSONB` in CockroachDB, which enforces validity at the database level as a final backstop.
+
+The job system's internal boundary carries `json.RawMessage` (not `[]byte`) to make this contract explicit throughout the call stack. Any handler that returns something that is not valid JSON will receive a registration-time panic, not a silent runtime failure.
 
 ### JobFn
 
-Each job type defines its own `Request` and `Response` structs. `JobFn` is a generic adapter that handles JSON marshaling/unmarshaling centrally. Individual handlers receive and return concrete Go types.
+Each job type defines its own `Request` and `Response` structs. `JobFn` is a generic adapter that handles JSON marshaling/unmarshaling centrally. Individual handlers receive and return concrete Go types; JSON encoding/decoding is never their responsibility.
 
 ```go
-// JobFn adapts a typed function to the internal []byte boundary.
+// JobFn adapts a typed function to the internal json.RawMessage boundary.
+// Req and Resp must be JSON-serializable; the invariant is enforced at
+// unmarshal (request) and marshal (response) time.
 type JobFn[Req, Resp any] func(ctx context.Context, req Req) (Resp, error)
 
-func (f JobFn[Req, Resp]) Handle(ctx context.Context, raw []byte) ([]byte, error) {
+func (f JobFn[Req, Resp]) Handle(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
     var req Req
     if err := json.Unmarshal(raw, &req); err != nil {
         return nil, fmt.Errorf("unmarshal request: %w", err)
@@ -641,7 +719,17 @@ js.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendW
 }))
 ```
 
-> **Why not proto?** Protobuf makes job attempt rows opaque in the database, requiring additional tooling to inspect payloads. At this stage, the maintenance overhead of `.proto` files and generated code is not justified. JSON via `JobFn` provides equivalent compile-time type safety with full debuggability in any SQL client at zero extra cost.
+At dispatch time, callers marshal their typed request before passing it to `Dispatch` or `Run`:
+
+```go
+req, err := json.Marshal(SendWelcomeEmailRequest{UserID: "u_123", Email: "user@example.com"})
+if err != nil {
+    return err
+}
+_, err = sys.Dispatch(ctx, db, "send_welcome_email", json.RawMessage(req), "")
+```
+
+> **Why not proto?** Protobuf makes job attempt rows opaque in the database, requiring additional tooling to inspect payloads. At this stage, the maintenance overhead of `.proto` files and generated code is not justified. JSON via `JobFn` provides equivalent compile-time type safety with full debuggability in any SQL client at zero extra cost. The JSON invariant is enforced at every layer, so there is no safety trade-off.
 
 ---
 
@@ -825,13 +913,39 @@ func (api *API) Cancel(ctx context.Context, jobID uuid.UUID, broadcast bool) err
 
 ### Retry
 
-Retry creates a special `__system:retry_job` via `Dispatch()`. This retry job is entirely internal to the job system and can retry any target job. When a worker picks it up and executes it, the retry job:
+Retry creates a special `__system:retry_job` via `Dispatch()`. This retry job is entirely internal to the job system and can retry any permanently-failed target job.
 
-1. Extends the target job's `max_attempts` budget by the original `max_attempts` value, so the job gets a fresh set of attempts starting from `last_attempt_no + 1`.
-2. Re-creates an unlocked lease for the target job (via `Create`) so workers can claim it on the next poll cycle.
-3. Circumvents normal backoff and max-attempts checks for the target job — the retry job directly manipulates the DB state to allow prompt re-execution.
+#### Design
 
-Retried jobs can themselves be cancelled (via the cancel endpoint) and re-retried (by calling retry again).
+The core problem is that the target job's `max_attempts` has already been exhausted — the normal claim-time validation (`nextAttemptNo > max_attempts`) would immediately mark the job failed again without executing. The retry job sidesteps this by **acting as the executor itself**: rather than re-enqueuing the target job for a worker to claim, the retry job's own handler directly inserts attempt rows for the target job and invokes its handler via `runOnce`, sharing the execution code path with normal job execution.
+
+The retry job has a very high `max_attempts` (equal to the original job's `max_attempts`) so it gets a full fresh set of attempts. Each attempt of the retry job corresponds to exactly one attempt of the target job:
+
+- If the target handler **succeeds**, the retry job records success on the target attempt row and returns successfully — the retry job is done.
+- If the target handler **fails**, the retry job records failure on the target attempt row and returns an error — the retry job's own retry mechanism (its `runWithRetry` loop) handles backoff and re-execution.
+
+This means the normal `runWithRetry` code path is shared: the retry job's execution is itself subject to `runWithRetry`, so backoff, lease heartbeating, graceful termination, and failure recording all work identically for retried jobs as for original jobs.
+
+#### Logic outline
+
+```
+__system:retry_job handler (one attempt = one target job handler invocation):
+  1. Load target job from DB (handler name, request, last attempt_no)
+  2. nextAttemptNo = last_attempt_no + 1
+  3. INSERT INTO job_attempts (job_id=target.id, attempt_no=nextAttemptNo, ...)
+     — this bypasses the normal claim-time max_attempts check; the retry job
+       is responsible for bounding total attempts via its own max_attempts.
+  4. Call w.runOnce(ctx, db, targetJob, targetAttempt)
+       runOnce: invoke handler once; call complete() on success, fail() on error.
+  5. If runOnce returns nil → target job is complete; return struct{}{}, nil
+     If runOnce returns error → return the error
+       → retry job's runWithRetry loop sleeps backoff, increments its own
+         attempt_no, and loops back to step 1 on the next retry job attempt.
+```
+
+`runOnce` is a helper extracted from `runWithRetry` that executes the handler a single time and records the result — `runWithRetry` is then a loop over `runOnce`. Both regular jobs and the retry job share this path.
+
+#### Code
 
 ```go
 // retryJobRequest is the request payload for the internal retry job.
@@ -842,57 +956,78 @@ type retryJobRequest struct {
 // registerSystemJobs also registers the retry job handler.
 // (continued from the cancel_job registration above)
 s.Register("__system:retry_job", jobs.JobFn(func(ctx context.Context, req retryJobRequest) (struct{}, error) {
-    tx, err := s.db.BeginTx(ctx, nil)
-    if err != nil {
-        return struct{}{}, err
-    }
-    defer tx.Rollback()
-
-    // Fetch current max_attempts and last attempt_no.
-    row := tx.QueryRowContext(ctx,
-        `SELECT j.max_attempts, COALESCE(MAX(a.attempt_no), 0)
+    // Load target job and find the next attempt number.
+    var targetJob Job
+    var lastAttemptNo int
+    row := s.db.QueryRowContext(ctx,
+        `SELECT j.id, j.name, j.request, j.backoff_policy, j.deadline,
+                COALESCE(MAX(a.attempt_no), 0)
          FROM jobs j
          LEFT JOIN job_attempts a ON a.job_id = j.id
          WHERE j.id = $1
-         GROUP BY j.max_attempts`,
+         GROUP BY j.id, j.name, j.request, j.backoff_policy, j.deadline`,
         req.TargetJobID,
     )
-    var maxAttempts, lastAttemptNo int
-    if err := row.Scan(&maxAttempts, &lastAttemptNo); err != nil {
-        return struct{}{}, fmt.Errorf("fetch job state: %w", err)
+    if err := row.Scan(
+        &targetJob.ID, &targetJob.Name, &targetJob.Request,
+        &targetJob.BackoffPolicy, &targetJob.Deadline, &lastAttemptNo,
+    ); err != nil {
+        return struct{}{}, fmt.Errorf("load target job: %w", err)
     }
 
     nextAttemptNo := lastAttemptNo + 1
 
-    // Extend the attempt budget so the job can run up to max_attempts more times.
-    _, err = tx.ExecContext(ctx,
-        `UPDATE jobs SET max_attempts = $1 WHERE id = $2`,
-        nextAttemptNo+maxAttempts-1, req.TargetJobID,
-    )
-    if err != nil {
-        return struct{}{}, fmt.Errorf("extend attempt budget: %w", err)
+    // Insert the next attempt row for the target job directly, bypassing
+    // normal claim-time max_attempts validation. The retry job's own
+    // max_attempts bounds the total number of additional attempts.
+    if _, err := s.db.ExecContext(ctx,
+        `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
+         VALUES ($1, $2, $3, $4)`,
+        targetJob.ID, nextAttemptNo, hostname, buildSHA,
+    ); err != nil {
+        return struct{}{}, fmt.Errorf("insert target attempt: %w", err)
     }
 
-    // Re-create the lease (unlocked) so workers can claim the target job again.
-    // The job_attempts row for the next attempt will be inserted by the worker
-    // that claims the lease, in the same tx as the lease acquisition.
-    if _, err := s.leases.Create(ctx, tx, systemNamespace, req.TargetJobID.String()); err != nil {
-        return struct{}{}, fmt.Errorf("re-create lease: %w", err)
+    targetAttempt := &Attempt{
+        JobID:     targetJob.ID,
+        AttemptNo: nextAttemptNo,
+        Request:   targetJob.Request,
+        // Note: no LeaseToken — the retry job holds the lease, not the target job.
     }
 
-    return struct{}{}, tx.Commit()
+    // Execute the target job's handler once, recording success/failure on the
+    // target job's attempt row. This shares the runOnce code path with normal
+    // job execution; the retry job's runWithRetry loop provides the outer retry.
+    if err := s.Worker.runOnce(ctx, s.db, &targetJob, targetAttempt); err != nil {
+        // Return the error so the retry job's own runWithRetry loop retries.
+        return struct{}{}, err
+    }
+    return struct{}{}, nil
 }))
 ```
 
-The retry endpoint simply dispatches the internal job and returns:
+When the retry job is dispatched, it sets `max_attempts` on itself equal to the original job's `max_attempts`, giving the target job a full second set of attempts:
 
 ```go
 func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
+    // Look up the original job's max_attempts to size the retry budget.
+    var origMaxAttempts int
+    if err := api.db.QueryRowContext(ctx,
+        `SELECT max_attempts FROM jobs WHERE id = $1`, jobID,
+    ).Scan(&origMaxAttempts); err != nil {
+        return fmt.Errorf("load job: %w", err)
+    }
+
     req, _ := json.Marshal(retryJobRequest{TargetJobID: jobID})
-    _, err := api.sys.Dispatch(ctx, api.db, "__system:retry_job", req, "")
+    _, err := api.sys.Dispatch(ctx, api.db, "__system:retry_job", req,
+        fmt.Sprintf("retry:%s", jobID), // stable key; prevents duplicate retries
+        jobs.WithMaxAttempts(origMaxAttempts),
+    )
     return err
 }
 ```
+
+Retried jobs can themselves be cancelled (via the cancel endpoint) and re-retried (by calling retry again). Re-retrying dispatches a new `__system:retry_job` with a fresh `max_attempts` budget.
 
 ---
 
@@ -1161,6 +1296,27 @@ The alternatives are:
 
 A dedicated `job_status` table is the cleanest option. It is updated within the same transaction as each lifecycle event, so it is always consistent with the execution tables. Reads are a simple primary-key lookup.
 
+### Should `job_status` store the response payload?
+
+**No. `job_status` does not store the response.**
+
+`job_status` is a high-load table: it is updated on every state transition and read by every status poll. Storing response payloads here would increase row size, amplify write cost, and put unnecessary pressure on the primary-key index. The table must stay lightweight — just enough to answer "is this job done?" without payload baggage.
+
+Response payloads remain in `job_attempts`. Callers that need the response read it from `job_attempts` directly after observing `status = 'complete'`. Callers that care only about job side effects (e.g. "did the email send?") check `job_status` and stop there — they never need to read `job_attempts` at all. This split lets each use-case pay only for what it actually needs.
+
+```
+Caller pattern A — cares about side effects only:
+  SELECT status FROM job_status WHERE job_id = $1
+  → done when status = 'complete'
+
+Caller pattern B — cares about the response value:
+  SELECT status FROM job_status WHERE job_id = $1
+  → on 'complete', SELECT response FROM job_attempts
+      WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1
+```
+
+`Run()` follows pattern B internally because it must return the response to the caller. `Dispatch()` follows pattern A — it waits for completion but does not surface the response.
+
 ### Schema
 
 ```sql
@@ -1169,6 +1325,7 @@ CREATE TABLE job_status (
     status      TEXT        NOT NULL,       -- 'pending' | 'running' | 'complete' | 'failed' | 'cancelled' | 'pending_retry'
     attempt_no  INT,                        -- most recent attempt number; NULL if never attempted
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- response is intentionally NOT stored here; read from job_attempts when needed
 );
 ```
 
@@ -1189,7 +1346,7 @@ CREATE TABLE job_status (
 Example — updating status inside `complete()`:
 
 ```go
-func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp []byte) error {
+func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
