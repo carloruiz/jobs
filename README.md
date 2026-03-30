@@ -64,6 +64,7 @@ An append-only log of work to be done. Each row represents one unit of work and 
 ```sql
 CREATE TABLE jobs (
     id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key  TEXT        NOT NULL,               -- deduplication key; auto-generated if not supplied
     name             TEXT        NOT NULL,               -- job type identifier
     namespace        TEXT        NOT NULL,               -- logical grouping
     max_attempts     INT         NOT NULL,
@@ -74,7 +75,9 @@ CREATE TABLE jobs (
     creator_host     TEXT        NOT NULL,               -- hostname of the service that dispatched
     metadata         JSONB,                              -- arbitrary caller-supplied key-value pairs
     logging_context  JSONB,                              -- logging fields to propagate into job execution
-    request          JSONB       NOT NULL                -- input payload (max 1MB)
+    request          JSONB       NOT NULL,               -- input payload (max 1MB)
+
+    UNIQUE (idempotency_key)
 );
 
 CREATE INDEX ON jobs (namespace, name, created_at);
@@ -266,6 +269,80 @@ func (s *System) Run(ctx context.Context, db DBTX, name, namespace string, req [
     }
     return resp, nil
 }
+```
+
+### Idempotency Key
+
+Every job row carries an `idempotency_key`. Its purpose is to prevent duplicate jobs from being created when a caller retries a failed `Dispatch()` or `Run()` call (e.g. due to a network timeout after the INSERT succeeded).
+
+**Rules:**
+- For `Dispatch()`: the caller may supply a key. If omitted, one is auto-generated (`uuid.NewString()`). Because auto-generated keys are unique by construction, omitting the key opts out of deduplication — safe when the caller does not retry.
+- For `Run()`: the caller **must** supply a key. `Run()` blocks until the job completes, so if the caller retries after a timeout, the second call should be a no-op (returning the result of the first execution) rather than launching a duplicate.
+
+**Deduplication behavior:**
+
+`Dispatch()` and `Run()` both attempt an `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`. If a row already exists for the key, the insert is skipped and the existing job is returned. The caller receives the same job ID on every call with the same key.
+
+```go
+// DispatchOptions carries optional parameters for Dispatch.
+type DispatchOptions struct {
+    IdempotencyKey string // leave empty to auto-generate
+}
+
+func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name, namespace string, req []byte, opts DispatchOptions) (*Job, error) {
+    key := opts.IdempotencyKey
+    if key == "" {
+        key = uuid.NewString() // auto-generate; deduplication is opted out
+    }
+
+    var job Job
+    err := db.QueryRowContext(ctx, `
+        INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (idempotency_key) DO UPDATE SET id = jobs.id  -- no-op update to return existing row
+        RETURNING id, idempotency_key, name, namespace`,
+        uuid.New(), key, name, namespace, buildSHA, hostname, req,
+    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+    if err != nil {
+        return nil, fmt.Errorf("insert job: %w", err)
+    }
+
+    // Only create the lease if this is a newly inserted row.
+    // If the job already existed (duplicate key), a lease already exists.
+    // leases.Create is a no-op if the resource already has a lease.
+    if _, err := p.leases.Create(ctx, db, namespace, job.ID.String()); err != nil {
+        return nil, fmt.Errorf("create lease: %w", err)
+    }
+
+    return &job, nil
+}
+
+// RunOptions carries parameters for Run; IdempotencyKey is required.
+type RunOptions struct {
+    IdempotencyKey string // required; callers must supply a stable key for deduplication
+}
+
+func (s *System) Run(ctx context.Context, db DBTX, name, namespace string, req []byte, opts RunOptions) ([]byte, error) {
+    if opts.IdempotencyKey == "" {
+        return nil, fmt.Errorf("Run: IdempotencyKey is required")
+    }
+    // ... same INSERT ON CONFLICT pattern, then CreateAndAcquire + execute locally.
+}
+```
+
+**Choosing an idempotency key:**
+
+The key should be derived from the caller's intent, not from internal IDs. Good examples:
+
+```go
+// Stable key for a per-user, per-day billing job.
+key := fmt.Sprintf("billing:%s:%s", userID, time.Now().UTC().Format("2006-01-02"))
+
+// Stable key for a webhook delivery attempt.
+key := fmt.Sprintf("webhook:%s:%d", webhookID, deliveryAttempt)
+
+// For fire-and-forget jobs where the caller does not retry, omit the key.
+sys.Dispatch(ctx, db, "send_notification", "default", req, jobs.DispatchOptions{})
 ```
 
 ### Claiming Jobs
@@ -674,7 +751,8 @@ The management API exposes job lifecycle operations. It is intended for internal
 |---|---|---|
 | `POST` | `/api/v1/jobs/:id/cancel?broadcast=true\|false` | Cancel a job. `broadcast=true` (default) signals all workers; `broadcast=false` skips broadcast for pending jobs. |
 | `POST` | `/api/v1/jobs/:id/retry` | Re-enqueue a permanently failed job via an internal retry job |
-| `GET` | `/api/v1/jobs/:id` | Get job status and attempt history |
+| `GET` | `/api/v1/jobs/:id/status` | Fast O(1) status lookup via `job_status` table |
+| `GET` | `/api/v1/jobs/:id` | Full job detail including attempt history |
 
 ### Cancel
 
@@ -856,3 +934,170 @@ func Register(sys *jobs.System, mailer *Mailer) {
 ```
 
 Adding a new job type only requires calling its `Register()` function at startup; the central wiring file does not need to be modified.
+
+---
+
+## Job Cleanup and Archival
+
+### Why cleanup matters
+
+The `jobs` and `job_attempts` tables grow without bound. Unbounded growth has real performance consequences:
+
+- **Index bloat**: range scans over `(namespace, name, created_at)` slow down as the index covers millions of completed rows that will never be claimed again.
+- **Vacuum / GC overhead**: CockroachDB's MVCC garbage collection must process historical versions for every row ever updated or deleted. A large hot table increases GC pause time and storage amplification.
+- **Lease polling latency**: `AcquireMany` joins `leases` against `jobs` — if `jobs` is large and the index is cold, this query degrades.
+
+### Why smart indexing alone is not enough
+
+Partial indexes (e.g. `WHERE finished_at IS NULL`) help claim-time queries but do not reduce table size. The table still grows unboundedly, compaction still has to scan all rows during GC, and backup/restore times grow linearly. Indexing is a complement to archival, not a substitute.
+
+### Recommended approach: background archival to `job_history`
+
+Move terminal rows (`complete`, `failed`, `cancelled`) older than 30 days to a cold `job_history` table. The hot `jobs` table stays small; historical data remains queryable.
+
+```sql
+-- Cold archive table (identical schema to jobs; kept on cheaper/slower storage if available).
+CREATE TABLE job_history (LIKE jobs INCLUDING ALL);
+CREATE TABLE job_attempt_history (LIKE job_attempts INCLUDING ALL);
+```
+
+The archival job runs as a registered system job on a nightly cron schedule:
+
+```go
+s.Register("__system:archive_jobs", jobs.JobFn(func(ctx context.Context, req struct{}) (struct{}, error) {
+    cutoff := time.Now().UTC().AddDate(0, 0, -30)
+
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil {
+        return struct{}{}, err
+    }
+    defer tx.Rollback()
+
+    // Move old terminal jobs in batches to avoid long-running transactions.
+    // terminal = complete, failed, or cancelled (no open lease).
+    _, err = tx.ExecContext(ctx, `
+        WITH archived AS (
+            DELETE FROM jobs
+            WHERE created_at < $1
+              AND id NOT IN (SELECT resource::uuid FROM leases)
+            RETURNING *
+        )
+        INSERT INTO job_history SELECT * FROM archived`,
+        cutoff,
+    )
+    if err != nil {
+        return struct{}{}, fmt.Errorf("archive jobs: %w", err)
+    }
+
+    _, err = tx.ExecContext(ctx, `
+        WITH archived AS (
+            DELETE FROM job_attempts
+            WHERE job_id NOT IN (SELECT id FROM jobs)
+            RETURNING *
+        )
+        INSERT INTO job_attempt_history SELECT * FROM archived`,
+    )
+    if err != nil {
+        return struct{}{}, fmt.Errorf("archive job_attempts: %w", err)
+    }
+
+    return struct{}{}, tx.Commit()
+}))
+```
+
+> **Batch size**: for very large tables, archive in smaller batches (e.g. `LIMIT 1000` per transaction) to avoid holding locks. Run the archival job repeatedly until the backlog is cleared.
+
+> **CRDB Row-Level TTL**: CockroachDB 22.2+ supports [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl.html) natively (`ttl_expiration_expression`). This automatically deletes rows past a threshold without custom code, but does not support migrating rows to a cold table. Use TTL if you do not need to retain history; use the archival job if you do.
+
+---
+
+## Job Status Lookup
+
+### Problem
+
+Multiple callers — API handlers, support tooling, monitoring dashboards — need to look up the current status of a job by ID. The `jobs_overview` view answers this correctly, but it involves a correlated subquery (`LATERAL JOIN` against `job_attempts`) that becomes expensive under concurrent load and large table sizes.
+
+### Why a separate status table is the right answer
+
+The alternatives are:
+
+| Approach | Pros | Cons |
+|---|---|---|
+| Query `jobs_overview` on demand | No extra state | Join + subquery on every read; expensive at scale |
+| Add `status` column to `jobs` | Simple to query | `jobs` is append-only by design; adding a mutable column breaks that invariant |
+| Dedicated `job_status` table | O(1) lookup; no joins; easy to index; decoupled from execution tables | Requires updates at lifecycle events; one more table to keep consistent |
+
+A dedicated `job_status` table is the cleanest option. It is updated within the same transaction as each lifecycle event, so it is always consistent with the execution tables. Reads are a simple primary-key lookup.
+
+### Schema
+
+```sql
+CREATE TABLE job_status (
+    job_id      UUID        PRIMARY KEY REFERENCES jobs(id),
+    status      TEXT        NOT NULL,       -- 'pending' | 'running' | 'complete' | 'failed' | 'cancelled' | 'pending_retry'
+    attempt_no  INT,                        -- most recent attempt number; NULL if never attempted
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### Lifecycle update points
+
+`job_status` is written once at creation and updated in the same transaction as every state transition:
+
+| Event | Status written | Where |
+|---|---|---|
+| Job created (`Dispatch` / `Run`) | `pending` | Inside the INSERT tx |
+| Worker claims lease + inserts attempt | `running` | Inside `claimBatch` tx |
+| Job completes successfully | `complete` | Inside `complete()` tx |
+| Transient failure (retry remaining) | `pending_retry` | Inside `fail()` tx |
+| Permanent failure (no retries) | `failed` | Inside `fail()` tx |
+| Job cancelled | `cancelled` | Inside `__system:cancel_job` tx |
+| Manual retry dispatched | `pending` | Inside `__system:retry_job` tx |
+
+Example — updating status inside `complete()`:
+
+```go
+func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp []byte) error {
+    _, err := tx.ExecContext(ctx,
+        `UPDATE job_attempts SET response = $1, finished_at = now()
+         WHERE job_id = $2 AND attempt_no = $3`,
+        resp, attempt.JobID, attempt.AttemptNo,
+    )
+    if err != nil {
+        return err
+    }
+
+    // Update denormalized status in the same tx.
+    _, err = tx.ExecContext(ctx,
+        `INSERT INTO job_status (job_id, status, attempt_no, updated_at)
+         VALUES ($1, 'complete', $2, now())
+         ON CONFLICT (job_id) DO UPDATE SET status = 'complete', attempt_no = $2, updated_at = now()`,
+        attempt.JobID, attempt.AttemptNo,
+    )
+    if err != nil {
+        return err
+    }
+
+    return w.leases.Delete(ctx, tx, job.ID.String())
+}
+```
+
+### Lookup
+
+```go
+func (api *API) GetJobStatus(ctx context.Context, jobID uuid.UUID) (*JobStatus, error) {
+    var s JobStatus
+    err := api.db.QueryRowContext(ctx,
+        `SELECT job_id, status, attempt_no, updated_at FROM job_status WHERE job_id = $1`,
+        jobID,
+    ).Scan(&s.JobID, &s.Status, &s.AttemptNo, &s.UpdatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &s, nil
+}
+```
+
+This is a single primary-key scan — effectively O(1) regardless of how many jobs exist.
+
+> **`jobs_overview` is still useful** for debugging and ad-hoc queries where you want attempt history alongside status. `job_status` is the fast path for programmatic lookups.
