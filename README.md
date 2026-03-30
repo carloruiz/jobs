@@ -38,6 +38,7 @@ This is a deliberately minimal system. The following features are absent by desi
 ### Guarantees
 
 - **At-least-once execution**: Every job will be attempted at least once. Lease expiry ensures stalled jobs are re-claimed by another worker.
+- **Local retry preference**: On transient failure, the executing worker retains the lease and retries the job locally after the configured backoff. The lease is only released to the pool on graceful termination. This minimizes unnecessary claim contention and preserves handler locality (in-process state, local caches).
 - **No silent drops**: Unknown job types are logged and released, never silently ignored.
 - **Durable state**: All job and attempt state is persisted in CockroachDB before execution begins.
 
@@ -77,7 +78,7 @@ CREATE TABLE jobs (
     logging_context  JSONB,                              -- logging fields to propagate into job execution
     request          JSONB       NOT NULL,               -- input payload (max 1MB)
 
-    UNIQUE (idempotency_key)
+    UNIQUE (name, idempotency_key)    -- scoped per job type
 );
 
 CREATE INDEX ON jobs (namespace, name, created_at);
@@ -179,7 +180,9 @@ This view is used for debugging, not for claim logic.
 
 ### Dispatching a Job
 
-`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job row and an unlocked lease, then returns immediately — a worker will claim the lease and execute the job asynchronously. `Run()` creates the job, acquires the lease locally via `CreateAndAcquire`, creates the job attempt, and executes the handler in-process, blocking until completion.
+`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job row and an unlocked lease, then returns immediately — a worker will claim the lease and execute the job asynchronously. `Run()` creates the job, acquires the lease locally, and executes the handler in-process, blocking until completion.
+
+Namespace is a system-wide configuration (set on `Worker` / `System` at startup) and is not a per-call parameter.
 
 A top-level `System` struct composes both `Publisher` and `Worker`, promoting their methods for convenience.
 
@@ -192,143 +195,135 @@ type System struct {
 
 // Publisher dispatches jobs into the system.
 type Publisher struct {
-    leases leases.Store
-}
-
-// Dispatch creates the job row and an unlocked lease, then returns immediately.
-// No job attempt is created here — that happens when a worker claims the lease.
-func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name, namespace string, req []byte) (*Job, error) {
-    job := &Job{
-        ID:        uuid.New(),
-        Name:      name,
-        Namespace: namespace,
-    }
-
-    _, err := db.ExecContext(ctx,
-        `INSERT INTO jobs (id, name, namespace, creator_sha, creator_host, request)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        job.ID, job.Name, job.Namespace, buildSHA, hostname, req,
-    )
-    if err != nil {
-        return nil, fmt.Errorf("insert job: %w", err)
-    }
-
-    // Create the lease (unlocked) so a worker can claim it asynchronously.
-    if _, err := p.leases.Create(ctx, db, namespace, job.ID.String()); err != nil {
-        return nil, fmt.Errorf("create lease: %w", err)
-    }
-
-    return job, nil
-}
-
-// Run creates the job, acquires the lease locally, and executes the handler in-process.
-// It blocks until the job completes, returning the response.
-func (s *System) Run(ctx context.Context, db DBTX, name, namespace string, req []byte) ([]byte, error) {
-    job := &Job{
-        ID:        uuid.New(),
-        Name:      name,
-        Namespace: namespace,
-        Request:   req,
-    }
-
-    // 1. Create the job row.
-    _, err := db.ExecContext(ctx,
-        `INSERT INTO jobs (id, name, namespace, creator_sha, creator_host, request)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        job.ID, job.Name, job.Namespace, buildSHA, hostname, req,
-    )
-    if err != nil {
-        return nil, fmt.Errorf("insert job: %w", err)
-    }
-
-    // 2. Create and acquire the lease so no other worker claims it.
-    if _, err := s.leases.CreateAndAcquire(ctx, db, namespace, job.ID.String(), hostname, leaseDuration); err != nil {
-        return nil, fmt.Errorf("create and acquire lease: %w", err)
-    }
-
-    // 3. Create the first job attempt.
-    attempt := &Attempt{JobID: job.ID, AttemptNo: 1}
-    _, err = db.ExecContext(ctx,
-        `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
-         VALUES ($1, 1, $2, $3)`,
-        job.ID, hostname, buildSHA,
-    )
-    if err != nil {
-        return nil, fmt.Errorf("insert attempt: %w", err)
-    }
-
-    // 4. Execute the job locally via the Worker's handler registry.
-    resp, execErr := s.Worker.registry[name].Handle(ctx, req)
-    if execErr != nil {
-        _ = s.Worker.fail(ctx, db, job, attempt, execErr)
-        return nil, fmt.Errorf("job failed: %w", execErr)
-    }
-
-    if err := s.Worker.complete(ctx, db, job, attempt, resp); err != nil {
-        return nil, fmt.Errorf("complete job: %w", err)
-    }
-    return resp, nil
+    namespace string
+    leases    leases.Store
 }
 ```
+
+Full implementation details — including idempotency key handling, deduplication behavior, and the `Run()` polling path for duplicate keys — are in the [Idempotency Key](#idempotency-key) section below.
 
 ### Idempotency Key
 
 Every job row carries an `idempotency_key`. Its purpose is to prevent duplicate jobs from being created when a caller retries a failed `Dispatch()` or `Run()` call (e.g. due to a network timeout after the INSERT succeeded).
 
 **Rules:**
-- For `Dispatch()`: the caller may supply a key. If omitted, one is auto-generated (`uuid.NewString()`). Because auto-generated keys are unique by construction, omitting the key opts out of deduplication — safe when the caller does not retry.
-- For `Run()`: the caller **must** supply a key. `Run()` blocks until the job completes, so if the caller retries after a timeout, the second call should be a no-op (returning the result of the first execution) rather than launching a duplicate.
+- For `Dispatch()`: `idempotencyKey` is optional. Pass `""` to auto-generate a UUID, opting out of deduplication — safe for fire-and-forget callers that do not retry.
+- For `Run()`: `idempotencyKey` is **required** (non-empty). `Run()` blocks until the job completes; if the caller retries after a timeout, the second call polls for the result of the first execution rather than launching a duplicate.
 
-**Deduplication behavior:**
-
-`Dispatch()` and `Run()` both attempt an `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`. If a row already exists for the key, the insert is skipped and the existing job is returned. The caller receives the same job ID on every call with the same key.
+**Signatures:**
 
 ```go
-// DispatchOptions carries optional parameters for Dispatch.
-type DispatchOptions struct {
-    IdempotencyKey string // leave empty to auto-generate
-}
-
-func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name, namespace string, req []byte, opts DispatchOptions) (*Job, error) {
-    key := opts.IdempotencyKey
+// Dispatch creates the job row and an unlocked lease, then returns immediately.
+// idempotencyKey is optional; pass "" to auto-generate (opts out of deduplication).
+func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req []byte, idempotencyKey string) (*Job, error) {
+    key := idempotencyKey
     if key == "" {
-        key = uuid.NewString() // auto-generate; deduplication is opted out
+        key = uuid.NewString()
     }
 
     var job Job
     err := db.QueryRowContext(ctx, `
         INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (idempotency_key) DO UPDATE SET id = jobs.id  -- no-op update to return existing row
+        ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
         RETURNING id, idempotency_key, name, namespace`,
-        uuid.New(), key, name, namespace, buildSHA, hostname, req,
+        uuid.New(), key, name, p.namespace, buildSHA, hostname, req,
     ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
     if err != nil {
         return nil, fmt.Errorf("insert job: %w", err)
     }
 
-    // Only create the lease if this is a newly inserted row.
-    // If the job already existed (duplicate key), a lease already exists.
-    // leases.Create is a no-op if the resource already has a lease.
-    if _, err := p.leases.Create(ctx, db, namespace, job.ID.String()); err != nil {
+    // leases.Create is a no-op if a lease already exists for this job.
+    if _, err := p.leases.Create(ctx, db, p.namespace, job.ID.String()); err != nil {
         return nil, fmt.Errorf("create lease: %w", err)
     }
 
     return &job, nil
 }
 
-// RunOptions carries parameters for Run; IdempotencyKey is required.
-type RunOptions struct {
-    IdempotencyKey string // required; callers must supply a stable key for deduplication
+// Run creates the job, acquires the lease locally, and executes the handler in-process.
+// idempotencyKey is required. If a job with this (name, key) already exists, Run polls
+// job_status until the job reaches a terminal state, then returns the result.
+func (s *System) Run(ctx context.Context, db DBTX, name string, req []byte, idempotencyKey string) ([]byte, error) {
+    if idempotencyKey == "" {
+        return nil, fmt.Errorf("Run: idempotencyKey is required")
+    }
+
+    var job Job
+    var isNew bool
+    err := db.QueryRowContext(ctx, `
+        INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
+        RETURNING id, idempotency_key, name, namespace, (xmax = 0) AS inserted`,
+        uuid.New(), idempotencyKey, name, s.namespace, buildSHA, hostname, req,
+    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace, &isNew)
+    if err != nil {
+        return nil, fmt.Errorf("insert job: %w", err)
+    }
+
+    if !isNew {
+        // Job already exists — poll until terminal, then return the stored result.
+        return s.pollForResult(ctx, db, job.ID)
+    }
+
+    // Newly created job: acquire the lease locally and execute in-process.
+    if _, err := s.leases.CreateAndAcquire(ctx, db, s.namespace, job.ID.String(), hostname, leaseDuration); err != nil {
+        return nil, fmt.Errorf("create and acquire lease: %w", err)
+    }
+
+    attempt := &Attempt{JobID: job.ID, AttemptNo: 1}
+    if _, err = db.ExecContext(ctx,
+        `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
+         VALUES ($1, 1, $2, $3)`,
+        job.ID, hostname, buildSHA,
+    ); err != nil {
+        return nil, fmt.Errorf("insert attempt: %w", err)
+    }
+
+    return s.Worker.runWithRetry(ctx, db, &job, attempt)
 }
 
-func (s *System) Run(ctx context.Context, db DBTX, name, namespace string, req []byte, opts RunOptions) ([]byte, error) {
-    if opts.IdempotencyKey == "" {
-        return nil, fmt.Errorf("Run: IdempotencyKey is required")
+// pollForResult polls job_status until the job reaches a terminal state,
+// then fetches the response from job_attempts.
+func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) ([]byte, error) {
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case <-ticker.C:
+            var status string
+            err := db.QueryRowContext(ctx,
+                `SELECT status FROM job_status WHERE job_id = $1`, jobID,
+            ).Scan(&status)
+            if err != nil {
+                return nil, err
+            }
+            switch status {
+            case "complete":
+                var resp []byte
+                err = db.QueryRowContext(ctx,
+                    `SELECT response FROM job_attempts
+                     WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1`,
+                    jobID,
+                ).Scan(&resp)
+                return resp, err
+            case "failed", "cancelled":
+                return nil, fmt.Errorf("job %s: %s", jobID, status)
+            }
+            // pending, running, pending_retry — keep polling
+        }
     }
-    // ... same INSERT ON CONFLICT pattern, then CreateAndAcquire + execute locally.
 }
 ```
+
+**Deduplication behavior:**
+
+`Dispatch()` uses `INSERT ... ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id`. If a row already exists for the `(name, key)` pair, the insert is a no-op and the existing job is returned unchanged. The caller receives the same job ID on every call with the same key.
+
+`Run()` additionally detects whether the INSERT created a new row (via `xmax = 0`). If a conflict was found, `Run()` blocks in `pollForResult` until the original execution completes, then returns its stored response — so a caller retrying a timed-out `Run()` does not launch a duplicate.
 
 **Choosing an idempotency key:**
 
@@ -337,12 +332,14 @@ The key should be derived from the caller's intent, not from internal IDs. Good 
 ```go
 // Stable key for a per-user, per-day billing job.
 key := fmt.Sprintf("billing:%s:%s", userID, time.Now().UTC().Format("2006-01-02"))
+sys.Dispatch(ctx, db, "charge_subscription", req, key)
 
 // Stable key for a webhook delivery attempt.
 key := fmt.Sprintf("webhook:%s:%d", webhookID, deliveryAttempt)
+sys.Dispatch(ctx, db, "deliver_webhook", req, key)
 
-// For fire-and-forget jobs where the caller does not retry, omit the key.
-sys.Dispatch(ctx, db, "send_notification", "default", req, jobs.DispatchOptions{})
+// Fire-and-forget: no retries expected, omit the key.
+sys.Dispatch(ctx, db, "send_notification", req, "")
 ```
 
 ### Claiming Jobs
@@ -461,9 +458,10 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
 1. Worker claims a batch of leases (in a transaction).
 2. In the same transaction, for each lease, the job is validated and a new `job_attempts` row is inserted. The lease acquisition and attempt insertion are atomic.
 3. The transaction commits. The handler is invoked with the request payload.
-4. On success: the `response` and `finished_at` columns are written; the lease is deleted.
-5. On transient failure: the `error` and `finished_at` columns are written on the current attempt; the lease is released so another worker can re-claim. When a worker later claims the lease, it inserts a new `job_attempts` row in the same transaction as the lease acquisition.
+4. On success: the `response` and `finished_at` columns are written in a transaction; the lease is deleted in the same transaction.
+5. On transient failure: the `error` and `finished_at` columns are written on the current attempt; **the lease is retained**. The worker sleeps for the configured backoff duration, inserts a new `job_attempts` row, and re-executes the handler locally — no other worker can claim the job while this worker holds the lease.
 6. On permanent failure (no attempts remaining): the `error` and `finished_at` columns are written; the lease is deleted.
+7. On graceful termination: leases for any in-flight jobs are released, allowing another worker to re-claim them.
 
 ### Writing the Response
 
@@ -487,10 +485,10 @@ func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attem
 ### Recording a Failure
 
 ```go
-// fail must be called within a transaction so the error write and lease
-// update are atomic — a crash between them would leave the job in an inconsistent state.
+// fail records the error on the current attempt. On permanent failure, the lease
+// is deleted. On transient failure, the lease is retained — the caller (runWithRetry)
+// is responsible for sleeping the backoff duration and inserting the next attempt row.
 func (w *Worker) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, execErr error) error {
-    // Record the failure on the current attempt.
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET error = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -505,11 +503,70 @@ func (w *Worker) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, 
         return w.leases.Delete(ctx, tx, job.ID.String())
     }
 
-    // Transient failure — release the lease so another worker can re-claim.
-    // The next job_attempts row is NOT inserted here; it will be inserted by
-    // the worker that claims the lease on the next poll cycle (in the same tx
-    // as the lease acquisition).
-    return w.leases.Release(ctx, tx, job.ID.String(), attempt.LeaseToken)
+    // Transient failure — lease is retained. runWithRetry will sleep the backoff
+    // duration, insert the next job_attempts row, and retry locally.
+    return nil
+}
+```
+
+### Local Retry Loop
+
+The worker retries failed jobs locally rather than releasing the lease and waiting for another worker to re-claim. This eliminates unnecessary claim contention and keeps the job close to in-process state (caches, connections).
+
+```go
+// runWithRetry executes the job handler, retrying locally on transient failure.
+// The lease is held for the entire retry loop; it is deleted on success or
+// permanent failure, and released on context cancellation (graceful termination).
+func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) ([]byte, error) {
+    for {
+        resp, execErr := w.registry[job.Name].Handle(ctx, attempt.Request)
+        if execErr == nil {
+            tx, _ := db.BeginTx(ctx, nil)
+            if err := w.complete(ctx, tx, job, attempt, resp); err != nil {
+                tx.Rollback()
+                return nil, err
+            }
+            return resp, tx.Commit()
+        }
+
+        // Record the failure atomically.
+        tx, _ := db.BeginTx(ctx, nil)
+        if err := w.fail(ctx, tx, job, attempt, execErr); err != nil {
+            tx.Rollback()
+            return nil, err
+        }
+        tx.Commit()
+
+        if attempt.AttemptNo >= job.MaxAttempts {
+            // Permanent failure — lease already deleted inside fail().
+            return nil, execErr
+        }
+
+        // Transient failure: sleep backoff, then insert the next attempt row and loop.
+        backoff := w.backoffFor(job, attempt.AttemptNo)
+        select {
+        case <-ctx.Done():
+            // Graceful termination: release the lease so another worker can re-claim.
+            _ = w.leases.Release(context.Background(), db, job.ID.String(), attempt.LeaseToken)
+            return nil, ctx.Err()
+        case <-time.After(backoff):
+        }
+
+        nextAttemptNo := attempt.AttemptNo + 1
+        if _, err := db.ExecContext(ctx,
+            `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
+             VALUES ($1, $2, $3, $4)`,
+            job.ID, nextAttemptNo, hostname, buildSHA,
+        ); err != nil {
+            return nil, fmt.Errorf("insert next attempt: %w", err)
+        }
+        attempt = &Attempt{
+            JobID:      job.ID,
+            AttemptNo:  nextAttemptNo,
+            Request:    attempt.Request,
+            LeaseToken: attempt.LeaseToken,
+        }
+    }
 }
 ```
 
@@ -614,7 +671,7 @@ type Store interface {
 - `CreateAndAcquire`: called during `Run()` to atomically create and hold the lease locally, preventing other workers from claiming it.
 - `Delete`: called on job completion, permanent failure, or cancellation to remove the lease row entirely.
 - `AcquireMany`: called during the claim loop to grab available leases.
-- `Release`: called on transient failure so another worker can re-claim the job on the next poll.
+- `Release`: called only during graceful termination so another worker can re-claim in-flight jobs. On transient failure, the lease is **retained** — the worker retries locally without releasing.
 - `HeartbeatMany`: called periodically by a background goroutine to keep active claims alive.
 
 ### Heartbeat Loop
@@ -761,7 +818,7 @@ The cancel endpoint creates and runs a `__system:cancel_job` in-process, which h
 ```go
 func (api *API) Cancel(ctx context.Context, jobID uuid.UUID, broadcast bool) error {
     req, _ := json.Marshal(cancelJobRequest{TargetJobID: jobID, Broadcast: broadcast})
-    _, err := api.sys.Run(ctx, api.db, "__system:cancel_job", systemNamespace, req)
+    _, err := api.sys.Run(ctx, api.db, "__system:cancel_job", req, uuid.NewString())
     return err
 }
 ```
@@ -832,7 +889,7 @@ The retry endpoint simply dispatches the internal job and returns:
 ```go
 func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
     req, _ := json.Marshal(retryJobRequest{TargetJobID: jobID})
-    _, err := api.sys.Dispatch(ctx, api.db, "__system:retry_job", systemNamespace, req)
+    _, err := api.sys.Dispatch(ctx, api.db, "__system:retry_job", req, "")
     return err
 }
 ```
@@ -887,6 +944,80 @@ func (w *Worker) execute(ctx context.Context, job *Job, attempt *Attempt) error 
 
 ---
 
+## Graceful Termination
+
+When a worker process receives SIGTERM, it enters a 2-minute grace period to allow in-flight jobs to finish before the process exits.
+
+### Shutdown Sequence
+
+1. **Stop accepting new claims** — the poll loop exits immediately; no new leases are acquired.
+2. **Drain in-flight jobs** — wait up to 2 minutes for all running handlers to complete naturally.
+3. **Cancel remaining jobs** — if any jobs are still running after 2 minutes, cancel their contexts. Handlers that respect context cancellation will stop promptly.
+4. **Release leases** — for any jobs that did not finish, release their leases so another worker can re-claim them.
+5. **Exit** — the process exits cleanly.
+
+```go
+func (w *Worker) Shutdown() {
+    // 1. Stop the poll loop.
+    w.stopPoll()
+
+    const gracePeriod = 2 * time.Minute
+
+    // 2. Wait for in-flight jobs to finish, up to the grace period.
+    done := make(chan struct{})
+    go func() {
+        w.activeWg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        // All jobs finished cleanly within the grace period.
+        return
+    case <-time.After(gracePeriod):
+        // Grace period elapsed — cancel all remaining job contexts.
+    }
+
+    // 3. Cancel contexts of all still-running jobs.
+    w.mu.Lock()
+    for _, entry := range w.activeJobs {
+        entry.cancel()
+    }
+    w.mu.Unlock()
+
+    // 4. Wait for all goroutines to exit after cancellation.
+    w.activeWg.Wait()
+
+    // 5. Release leases for jobs that did not finish naturally.
+    // Completed/failed jobs already deleted or released their leases inside runWithRetry;
+    // only the context-cancelled jobs still hold leases at this point.
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    w.mu.Lock()
+    for _, entry := range w.activeJobs {
+        _ = w.leases.Release(ctx, w.db, entry.jobID.String(), entry.leaseToken)
+    }
+    w.mu.Unlock()
+}
+```
+
+`Shutdown()` is wired to OS signals in `main`:
+
+```go
+sigCh := make(chan os.Signal, 1)
+signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+<-sigCh
+worker.Shutdown()
+```
+
+### Interaction with Local Retry
+
+Because the worker retains leases during transient failures and retries locally, graceful termination must account for jobs that are currently sleeping between retry attempts. These jobs are tracked in `w.activeJobs` alongside actively-executing jobs. Cancelling their context in step 3 wakes them from the backoff `select` in `runWithRetry`, which triggers an immediate `leases.Release` before the goroutine exits.
+
+This guarantees that no lease is left held by a stopped process — even jobs mid-backoff are cleanly returned to the pool for another worker to claim.
+
+---
+
 ## Dependency Injection
 
 Handlers are registered as closures, capturing their dependencies (DB pool, HTTP clients, third-party SDKs) at startup. The job system has no knowledge of application-level dependencies — it only holds a map of `name → handler function`.
@@ -897,6 +1028,7 @@ Wiring happens in a single location (e.g. `main.go` or a dedicated wiring file).
 // main.go or wiring.go
 
 func wire(db *pgxpool.Pool, mailer *Mailer, billingClient *BillingClient) *jobs.System {
+    // Namespace is configured once on the System; it is not a per-call argument.
     sys := jobs.NewSystem(db, leaseStore, jobs.WorkerConfig{
         Namespace:    "default",
         BatchSize:    10,
