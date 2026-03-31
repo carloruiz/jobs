@@ -29,7 +29,8 @@ point, you are expected to outgrow it and migrate to a more capable system.
 
 ## What This System Is Missing
 
-This is a deliberately minimal system. The following features are absent by design:
+This is a deliberately minimal system. The following features are
+absent by design:
 
 | Missing Feature | Notes |
 |---|---|
@@ -72,16 +73,12 @@ This is a deliberately minimal system. The following features are absent by desi
 - **Failure hooks**: Callers can register a callback that runs once a job has
   permanently failed (exhausted all retries). This hook is called exactly once,
   after the final failed attempt is recorded.
-- **TODO**: What happens when a server crashes on the last job attempt? The
-  lease will eventually expire, and a new worker will claim the job. But
-  `attempt_no` will already equal `max_attempts`, so the job will be marked
-  permanently failed without executing. Is this the right behavior? Consider
-  whether to count "did not finish" separately from "failed with an error".
 
 ---
 
 ## Data Model
 
+// TODO: add job_status to the list
 Three tables form the foundation: `jobs`, `job_attempts`.
 
 ### `jobs`
@@ -96,7 +93,7 @@ CREATE TABLE jobs (
     idempotency_key  TEXT        NOT NULL,               -- deduplication key; auto-generated if not supplied
     name             TEXT        NOT NULL,               -- job type identifier
     namespace        TEXT        NOT NULL,               -- logical grouping
-    metadata         JSONB,                              -- arbitrary caller-supplied key-value pairs
+    metadata         JSONB,                              -- arbitrary caller-supplied key-value pairs; "system" key reserved for context propagation
     request          JSONB       NOT NULL,               -- input payload (max 1MB)
     max_attempts     INT         NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -184,7 +181,8 @@ LEFT JOIN LATERAL (
 ) a ON true;
 ```
 
-To filter or limit results, query the view with parameters rather than relying on the view alone:
+To filter or limit results, query the view with parameters rather
+than relying on the view alone:
 
 ```sql
 -- Filter by job type, namespace, and state; order by creation time; limit results
@@ -204,43 +202,38 @@ This view is used for debugging, not for claim logic.
 
 ### Dispatching a Job
 
-`Publisher` is the struct responsible for dispatching jobs. `Dispatch()`
-creates the job row and, if no conflict is found, **prefers local execution**:
-it immediately acquires the lease and runs the handler in a goroutine, rather
-than creating an unlocked lease and waiting for a worker to claim it. If a
-conflict is found (same idempotency key), `Dispatch()` checks whether the
-existing job is actively running; if it is, it polls for the result and returns
-it. `Run()` does the same but blocks until completion.
+`System` is the top-level struct that handles both dispatching and
+executing jobs. `Dispatch()` creates the job row and, if no conflict
+is found, **prefers local execution**: it immediately acquires the
+lease and runs the handler in a goroutine, rather than creating an
+unlocked lease and waiting for the claim loop to pick it up. If a
+conflict is found (same idempotency key), `Dispatch()` checks
+whether the existing job is actively running; if it is, it polls for
+the result and returns it. `Run()` does the same but blocks until
+completion.
 
-Preferring local execution in `Dispatch()` avoids a round-trip through the
-claim poll cycle: the dispatching process acts as both publisher and executor.
-Falling back to an unlocked lease (async worker claim) only occurs when local
-execution cannot proceed — for example, when a race prevents immediate lease
-acquisition.
+Preferring local execution in `Dispatch()` avoids a round-trip
+through the claim poll cycle: the dispatching process acts as both
+dispatcher and executor. Falling back to an unlocked lease (async
+claim) only occurs when local execution cannot proceed — for
+example, when a race prevents immediate lease acquisition.
 
-Namespace is a system-wide configuration (set on `Worker` / `System` at
+Namespace is a system-wide configuration (set on `System` at
 startup) and is not a per-call parameter.
 
-A top-level `System` struct composes both `Publisher` and `Worker`, promoting
-their methods for convenience.
-
 ```go
-// System is the top-level entry point. Publisher and Worker are promoted.
 type System struct {
-    *Publisher
-    *Worker
-}
-
-// Publisher dispatches jobs into the system.
-type Publisher struct {
     namespace string
+    db        DBTX
     leases    leases.Store
-    worker    *Worker
+    registry  map[string]Handler
+    poller    *statusPoller
 }
 ```
 
-Full implementation details — including idempotency key handling, deduplication
-behavior, and the `Run()` polling path for duplicate keys — are in the
+Full implementation details — including idempotency key handling,
+deduplication behavior, and the `Run()` polling path for duplicate
+keys — are in the
 [Idempotency Key](#idempotency-key) section below.
 
 ### Idempotency Key
@@ -265,7 +258,7 @@ call (e.g. due to a network timeout after the INSERT succeeded).
 // locally in a goroutine. If the job already exists, Dispatch polls job_status until
 // the job reaches a terminal state and returns.
 // req must be a valid JSON-encoded payload.
-func (p *Publisher) Dispatch(
+func (js *System) Dispatch(
     ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string,
 ) (*Job, error) {
     key := idempotencyKey
@@ -281,27 +274,34 @@ func (p *Publisher) Dispatch(
     defer tx.Rollback(ctx)
 
     var job Job
-    var isNew bool
     err = tx.QueryRow(ctx, `
         INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
-        RETURNING id, idempotency_key, name, namespace, (xmax = 0) AS inserted`,
-        uuid.New(), key, name, p.namespace, buildSHA, hostname, req,
-    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace, &isNew)
-    if err != nil {
-        return nil, fmt.Errorf("insert job: %w", err)
-    }
-
-    if !isNew {
+        ON CONFLICT (name, idempotency_key) DO NOTHING
+        RETURNING id, idempotency_key, name, namespace`,
+        uuid.New(), key, name, js.namespace, buildSHA, hostname, req,
+    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+    if err == pgx.ErrNoRows {
+        // Job already exists — fetch it.
+        err = tx.QueryRow(ctx, `
+            SELECT id, idempotency_key, name, namespace FROM jobs
+            WHERE name = $1 AND idempotency_key = $2`,
+            name, key,
+        ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+        if err != nil {
+            return nil, fmt.Errorf("fetch existing job: %w", err)
+        }
         if err := tx.Commit(ctx); err != nil {
             return nil, fmt.Errorf("commit: %w", err)
         }
         return &job, nil
     }
+    if err != nil {
+        return nil, fmt.Errorf("insert job: %w", err)
+    }
 
     // Newly created job: create and acquire the lease atomically with the job row.
-    lease, err := p.leases.CreateAndAcquire(ctx, tx, p.namespace, job.ID.String(), hostname, leaseDuration)
+    lease, err := js.leases.CreateAndAcquire(ctx, tx, js.namespace, job.ID.String(), hostname, leaseDuration)
     if err != nil {
         return nil, fmt.Errorf("create and acquire lease: %w", err)
     }
@@ -322,7 +322,7 @@ func (p *Publisher) Dispatch(
 
     // TODO: we should be using the job system context but after extracting
     // relevant context fields.
-    go p.worker.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
+    go js.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
 
     return &job, nil
 }
@@ -332,7 +332,7 @@ func (p *Publisher) Dispatch(
 // job_status until the job reaches a terminal state, then returns the result.
 // req must be a valid JSON-encoded payload. dest is a pointer to the response type that
 // the result will be unmarshaled into.
-func (s *System) Run(
+func (js *System) Run(
     ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string, dest any,
 ) error {
     if idempotencyKey == "" {
@@ -347,32 +347,39 @@ func (s *System) Run(
     defer tx.Rollback(ctx)
 
     var job Job
-    var isNew bool
     err = tx.QueryRow(ctx, `
         INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
-        RETURNING id, idempotency_key, name, namespace, (xmax = 0) AS inserted`,
-        uuid.New(), idempotencyKey, name, s.namespace, buildSHA, hostname, req,
-    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace, &isNew)
-    if err != nil {
-        return fmt.Errorf("insert job: %w", err)
-    }
-
-    if !isNew {
+        ON CONFLICT (name, idempotency_key) DO NOTHING
+        RETURNING id, idempotency_key, name, namespace`,
+        uuid.New(), idempotencyKey, name, js.namespace, buildSHA, hostname, req,
+    ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+    if err == pgx.ErrNoRows {
+        // Job already exists — fetch it.
+        err = tx.QueryRow(ctx, `
+            SELECT id, idempotency_key, name, namespace FROM jobs
+            WHERE name = $1 AND idempotency_key = $2`,
+            name, idempotencyKey,
+        ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+        if err != nil {
+            return fmt.Errorf("fetch existing job: %w", err)
+        }
         if err := tx.Commit(ctx); err != nil {
             return fmt.Errorf("commit: %w", err)
         }
         // Job already exists — poll until terminal, then unmarshal the stored result.
-        raw, err := s.pollForResult(ctx, db, job.ID)
+        raw, err := js.pollForResult(ctx, db, job.ID)
         if err != nil {
             return err
         }
         return json.Unmarshal(raw, dest)
     }
+    if err != nil {
+        return fmt.Errorf("insert job: %w", err)
+    }
 
     // Newly created job: acquire the lease locally and execute in-process.
-    if _, err := s.leases.CreateAndAcquire(ctx, tx, s.namespace, job.ID.String(), hostname, leaseDuration); err != nil {
+    if _, err := js.leases.CreateAndAcquire(ctx, tx, js.namespace, job.ID.String(), hostname, leaseDuration); err != nil {
         return fmt.Errorf("create and acquire lease: %w", err)
     }
 
@@ -389,7 +396,7 @@ func (s *System) Run(
         return fmt.Errorf("commit: %w", err)
     }
 
-    raw, err := s.Worker.runWithRetry(ctx, db, &job, attempt)
+    raw, err := js.runWithRetry(ctx, db, &job, attempt)
     if err != nil {
         return err
     }
@@ -398,7 +405,7 @@ func (s *System) Run(
 
 // pollForCompletion polls job_status until the job reaches a terminal state.
 // Used by Dispatch() when a running duplicate is detected.
-func (p *Publisher) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUID) error {
+func (js *System) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUID) error {
     ticker := time.NewTicker(1 * time.Second)
     defer ticker.Stop()
     for {
@@ -427,7 +434,7 @@ func (p *Publisher) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.U
 // pollForResult polls job_status until the job reaches a terminal state,
 // then fetches the response from job_attempts. Used by Run() for duplicate detection.
 // See the Optimizations section for an optimized implementation of polling results
-func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (json.RawMessage, error) {
+func (js *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (json.RawMessage, error) {
     ticker := time.NewTicker(500 * time.Millisecond)
     defer ticker.Stop()
     for {
@@ -462,19 +469,21 @@ func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (j
 
 **Deduplication behavior:**
 
-`Dispatch()` uses `INSERT ... ON CONFLICT (name, idempotency_key) DO UPDATE SET
-id = jobs.id`. If a row already exists for the `(name, key)` pair, the insert
-is a no-op and the existing job is returned unchanged. The caller receives the
-same job ID on every call with the same key.
+Both `Dispatch()` and `Run()` use
+`INSERT ... ON CONFLICT (name, idempotency_key) DO NOTHING`. If the
+insert returns no rows (conflict), the existing job is fetched via a
+separate `SELECT`. The caller receives the same job ID on every call
+with the same key.
 
-`Run()` additionally detects whether the INSERT created a new row (via `xmax =
-0`). If a conflict was found, `Run()` blocks in `pollForResult` until the
-original execution completes, then returns its stored response — so a caller
-retrying a timed-out `Run()` does not launch a duplicate.
+For `Dispatch()`, the existing job is returned immediately. For
+`Run()`, it blocks in `pollForResult` until the original execution
+completes, then returns its stored response — so a caller retrying
+a timed-out `Run()` does not launch a duplicate.
 
 **Choosing an idempotency key:**
 
-The key should be derived from the caller's intent, not from internal IDs. Good examples:
+The key should be derived from the caller's intent, not from
+internal IDs. Good examples:
 
 ```go
 // Stable key for a per-user, per-day billing job.
@@ -491,18 +500,24 @@ sys.Dispatch(ctx, db, "send_notification", req, "")
 
 ### Claiming Jobs
 
-Workers poll for available work by acquiring leases from the `leases` table. Claim logic runs inside a transaction to prevent double-claims. In the same transaction, a new `job_attempts` row is inserted for each claimed job — this ensures that a job attempt only exists in the DB if a worker has actually committed to running it. Workers only claim job types that are registered locally, ensuring unknown job types are never silently dropped.
+The system polls for available work by acquiring leases from the
+`leases` table. Claim logic runs inside a transaction to prevent
+double-claims. In the same transaction, a new `job_attempts` row is
+inserted for each claimed job — this ensures that a job attempt only
+exists in the DB if a worker has actually committed to running it.
+The system only claims job types that are registered locally,
+ensuring unknown job types are never silently dropped.
 
 ```go
-func (w *Worker) claimBatch(ctx context.Context) ([]*Attempt, error) {
-    tx, err := w.db.BeginTx(ctx, nil)
+func (js *System) claimBatch(ctx context.Context) ([]*Attempt, error) {
+    tx, err := js.db.BeginTx(ctx, nil)
     if err != nil {
         return nil, err
     }
     defer tx.Rollback()
 
     // Acquire up to `batchSize` leases from this namespace.
-    leases, err := w.leases.AcquireMany(ctx, tx, w.namespace, w.batchSize, w.identity, leaseDuration)
+    leases, err := js.leases.AcquireMany(ctx, tx, js.namespace, js.batchSize, js.identity, leaseDuration)
     if err != nil {
         return nil, fmt.Errorf("acquire leases: %w", err)
     }
@@ -539,8 +554,8 @@ func (w *Worker) claimBatch(ctx context.Context) ([]*Attempt, error) {
 
         // Validate before inserting the attempt. If invalid, release the lease
         // and skip (do not insert a job_attempts row).
-        if err := w.validate(job, nextAttemptNo); err != nil {
-            w.handleValidationError(ctx, tx, job, err)
+        if err := js.validate(job, nextAttemptNo); err != nil {
+            js.handleValidationError(ctx, tx, job, err)
             continue
         }
 
@@ -565,9 +580,9 @@ func (w *Worker) claimBatch(ctx context.Context) ([]*Attempt, error) {
 
 Before executing, each claimed job is validated:
 
-1. **Registered job type** — if `name` is not in the local registry, the job is
-   released and skipped. This is safe when the number of job types is small (<
-   ~30).
+1. **Registered job type** — if `name` is not in the local
+   registry, the job is released and skipped. This is safe when
+   the number of job types is small (< ~30).
 2. **Max attempts** — if `nextAttemptNo > max_attempts`, the job is marked
    permanently failed and the lease is deleted.
 3. **Deadline** — if `deadline` is non-nil and has passed, the job is marked
@@ -580,8 +595,8 @@ Before executing, each claimed job is validated:
    stale work from a previous session.
 
 ```go
-func (w *Worker) validate(job *Job, nextAttemptNo int) error {
-    if _, ok := w.registry[job.Name]; !ok {
+func (js *System) validate(job *Job, nextAttemptNo int) error {
+    if _, ok := js.registry[job.Name]; !ok {
         return fmt.Errorf("unknown job type %q", job.Name)
     }
     if nextAttemptNo > job.MaxAttempts {
@@ -590,7 +605,7 @@ func (w *Worker) validate(job *Job, nextAttemptNo int) error {
     if job.Deadline != nil && time.Now().After(*job.Deadline) {
         return ErrDeadlineExceeded
     }
-    if w.devMode && time.Since(job.CreatedAt) > w.staleThreshold {
+    if js.devMode && time.Since(job.CreatedAt) > js.staleThreshold {
         return ErrStaleJobSkipped
     }
     return nil
@@ -612,7 +627,7 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
                                          ↘ Fail     → [pending_retry] or [failed]
 ```
 
-1. Worker claims a batch of leases (in a transaction).
+1. System claims a batch of leases (in a transaction).
 2. In the same transaction, for each lease, the job is validated and a new
    `job_attempts` row is inserted. The lease acquisition and attempt insertion
    are atomic.
@@ -634,7 +649,7 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
 ```go
 // complete must be called within a transaction so the response write and lease
 // deletion are atomic — a crash between them would leave the job in an inconsistent state.
-func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
+func (js *System) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -644,7 +659,7 @@ func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attem
         return err
     }
     // Lease is no longer needed — delete it entirely.
-    return w.leases.Delete(ctx, tx, job.ID.String())
+    return js.leases.Delete(ctx, tx, job.ID.String())
 }
 ```
 
@@ -654,7 +669,7 @@ func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attem
 // fail records the error on the current attempt. On permanent failure, the lease
 // is deleted. On transient failure, the lease is retained — the caller (runWithRetry)
 // is responsible for sleeping the backoff duration and inserting the next attempt row.
-func (w *Worker) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, execErr error) error {
+func (js *System) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, execErr error) error {
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET error = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -666,7 +681,7 @@ func (w *Worker) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, 
 
     if attempt.AttemptNo >= job.MaxAttempts {
         // Permanently failed — delete the lease so no worker ever re-claims it.
-        return w.leases.Delete(ctx, tx, job.ID.String())
+        return js.leases.Delete(ctx, tx, job.ID.String())
     }
 
     // Transient failure — lease is retained. runWithRetry will sleep the backoff
@@ -677,18 +692,21 @@ func (w *Worker) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, 
 
 ### Local Retry Loop
 
-The worker retries failed jobs locally rather than releasing the lease and waiting for another worker to re-claim. This eliminates unnecessary claim contention and keeps the job close to in-process state (caches, connections).
+The worker retries failed jobs locally rather than releasing the
+lease and waiting for another worker to re-claim. This eliminates
+unnecessary claim contention and keeps the job close to in-process
+state (caches, connections).
 
 ```go
 // runWithRetry executes the job handler, retrying locally on transient failure.
 // The lease is held for the entire retry loop; it is deleted on success or
 // permanent failure, and released on context cancellation (graceful termination).
-func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) (json.RawMessage, error) {
+func (js *System) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) (json.RawMessage, error) {
     for {
-        resp, execErr := w.registry[job.Name].Handle(ctx, attempt.Request)
+        resp, execErr := js.registry[job.Name].Handle(ctx, attempt.Request)
         if execErr == nil {
             tx, _ := db.BeginTx(ctx, nil)
-            if err := w.complete(ctx, tx, job, attempt, resp); err != nil {
+            if err := js.complete(ctx, tx, job, attempt, resp); err != nil {
                 tx.Rollback()
                 return nil, err
             }
@@ -697,7 +715,7 @@ func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *A
 
         // Record the failure atomically.
         tx, _ := db.BeginTx(ctx, nil)
-        if err := w.fail(ctx, tx, job, attempt, execErr); err != nil {
+        if err := js.fail(ctx, tx, job, attempt, execErr); err != nil {
             tx.Rollback()
             return nil, err
         }
@@ -709,11 +727,11 @@ func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *A
         }
 
         // Transient failure: sleep backoff, then insert the next attempt row and loop.
-        backoff := w.backoffFor(job, attempt.AttemptNo)
+        backoff := js.backoffFor(job, attempt.AttemptNo)
         select {
         case <-ctx.Done():
             // Graceful termination: release the lease so another worker can re-claim.
-            _ = w.leases.Release(context.Background(), db, job.ID.String(), attempt.LeaseToken)
+            _ = js.leases.Release(context.Background(), db, job.ID.String(), attempt.LeaseToken)
             return nil, ctx.Err()
         case <-time.After(backoff):
         }
@@ -738,7 +756,9 @@ func (w *Worker) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *A
 
 ### Backoff
 
-Backoff is enforced at claim time by comparing `started_at` of the most recent attempt against the configured delay for the current attempt number.
+Backoff is enforced at claim time by comparing `started_at` of the
+most recent attempt against the configured delay for the current
+attempt number.
 
 ```go
 var policy BackoffPolicy
@@ -766,8 +786,8 @@ enforced at every public interface boundary:
   system validates the payload is non-nil and well-formed before inserting it.
 - Handlers registered via `JobFn` automatically produce valid JSON responses
   via `json.Marshal`. Custom `Handler` implementations that produce raw bytes
-  must ensure their output is valid JSON — this is checked at registration time
-  with a sentinel validation.
+  must ensure their output is valid JSON — this is checked at
+  registration time with a sentinel validation.
 - The `request` and `response` columns are typed `JSONB` in CockroachDB, which
   enforces validity at the database level as a final backstop.
 
@@ -829,7 +849,8 @@ js.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendW
 }))
 ```
 
-At dispatch time, callers marshal their typed request before passing it to `Dispatch` or `Run`:
+At dispatch time, callers marshal their typed request before passing
+it to `Dispatch` or `Run`:
 
 ```go
 req, err := json.Marshal(SendWelcomeEmailRequest{UserID: "u_123", Email: "user@example.com"})
@@ -850,7 +871,8 @@ _, err = sys.Dispatch(ctx, db, "send_welcome_email", json.RawMessage(req), "")
 
 ## Locking and Heartbeats
 
-Locking is delegated entirely to the `leases` library. The job system does not own lock state.
+Locking is delegated entirely to the `leases` library. The job
+system does not own lock state.
 
 ### Leases Interface
 
@@ -890,7 +912,7 @@ heartbeats fail consistently (e.g. DB unavailable), the worker self-terminates
 to release all claims via lease expiry.
 
 ```go
-func (w *Worker) heartbeatLoop(ctx context.Context) {
+func (js *System) heartbeatLoop(ctx context.Context) {
     ticker := time.NewTicker(heartbeatInterval)
     defer ticker.Stop()
 
@@ -901,11 +923,11 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
         case <-ctx.Done():
             return
         case <-ticker.C:
-            reqs := w.activeLeasesAsHeartbeatRequests()
+            reqs := js.activeLeasesAsHeartbeatRequests()
             if len(reqs) == 0 {
                 continue
             }
-            _, err := w.leases.HeartbeatMany(ctx, w.db, reqs, leaseDuration)
+            _, err := js.leases.HeartbeatMany(ctx, js.db, reqs, leaseDuration)
             if err != nil {
                 consecutiveFailures++
                 slog.ErrorContext(ctx, "heartbeat failed", "err", err, "consecutive_failures", consecutiveFailures)
@@ -913,7 +935,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
                     slog.ErrorContext(ctx, "too many heartbeat failures, self-terminating")
                     // TODO: raise SIGTERM on the process so the OS/supervisor can
                     // perform a clean shutdown and restart instead of a hard exit.
-                    w.shutdown()
+                    js.shutdown()
                     return
                 }
                 continue
@@ -951,18 +973,18 @@ type cancelJobRequest struct {
 }
 
 // registerSystemJobs wires up internal system jobs at startup.
-func (s *System) registerSystemJobs() {
-    s.Register("__system:cancel_job", jobs.JobFn(func(ctx context.Context, req cancelJobRequest) (struct{}, error) {
+func (js *System) registerSystemJobs() {
+    js.Register("__system:cancel_job", jobs.JobFn(func(ctx context.Context, req cancelJobRequest) (struct{}, error) {
         if req.Broadcast {
             // Broadcast first so the running handler can begin stopping immediately.
-            if err := s.broadcastCancel(ctx, req.TargetJobID); err != nil {
+            if err := js.broadcastCancel(ctx, req.TargetJobID); err != nil {
                 return struct{}{}, fmt.Errorf("broadcast cancel: %w", err)
             }
         }
 
         // Mark the target job's latest open attempt as cancelled and delete its lease.
         // Both operations must succeed atomically.
-        tx, err := s.db.BeginTx(ctx, nil)
+        tx, err := js.db.BeginTx(ctx, nil)
         if err != nil {
             return struct{}{}, err
         }
@@ -978,7 +1000,7 @@ func (s *System) registerSystemJobs() {
         if err != nil {
             return struct{}{}, fmt.Errorf("mark cancelled: %w", err)
         }
-        if err := s.leases.Delete(ctx, tx, req.TargetJobID.String()); err != nil {
+        if err := js.leases.Delete(ctx, tx, req.TargetJobID.String()); err != nil {
             return struct{}{}, fmt.Errorf("delete lease: %w", err)
         }
         return struct{}{}, tx.Commit()
@@ -1000,15 +1022,15 @@ type activeJob struct {
 }
 
 // Each running job gets a cancellable context stored by job ID.
-func (w *Worker) handleCancelNotify(rw http.ResponseWriter, r *http.Request) {
+func (js *System) handleCancelNotify(rw http.ResponseWriter, r *http.Request) {
     var req cancelJobRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(rw, "bad request", http.StatusBadRequest)
         return
     }
-    w.mu.Lock()
-    entry, ok := w.activeJobs[req.TargetJobID]
-    w.mu.Unlock()
+    js.mu.Lock()
+    entry, ok := js.activeJobs[req.TargetJobID]
+    js.mu.Unlock()
     if ok {
         entry.cancel() // cancels the context passed to the handler
         // Dispatch a goroutine to wait for the handler goroutine to fully exit.
@@ -1033,7 +1055,7 @@ internal use (operators, support tooling) rather than external consumers.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/jobs/:id/cancel?broadcast=true\|false` | Cancel a job. `broadcast=true` (default) signals all workers; `broadcast=false` skips broadcast for pending jobs. |
-| `POST` | `/api/v1/jobs/:id/retry` | Re-enqueue a permanently failed job via an internal retry job |
+| `POST` | `/api/v1/jobs/:id/retry` | Re-execute a permanently failed job once |
 | `GET` | `/api/v1/jobs/:id/status` | Fast O(1) status lookup via `job_status` table |
 | `GET` | `/api/v1/jobs/:id` | Full job detail including attempt history |
 
@@ -1052,143 +1074,202 @@ func (api *API) Cancel(ctx context.Context, jobID uuid.UUID, broadcast bool) err
 
 ### Retry
 
-Retry creates a special `__system:retry_job` via `Dispatch()`. This retry job
-is entirely internal to the job system and can retry any permanently-failed
-target job.
+The retry endpoint re-executes a permanently failed job exactly once. The
+handler calls `Retry()`, which runs the target job's handler in-process —
+there is no special retry job or separate dispatch.
 
-#### Design
-
-The core problem is that the target job's `max_attempts` has already been
-exhausted — the normal claim-time validation (`nextAttemptNo > max_attempts`)
-would immediately mark the job failed again without executing. The retry job
-sidesteps this by **acting as the executor itself**: rather than re-enqueuing
-the target job for a worker to claim, the retry job's own handler directly
-inserts attempt rows for the target job and invokes its handler via `runOnce`,
-sharing the execution code path with normal job execution.
-
-The retry job has a very high `max_attempts` (equal to the original job's
-`max_attempts`) so it gets a full fresh set of attempts. Each attempt of the
-retry job corresponds to exactly one attempt of the target job:
-
-- If the target handler **succeeds**, the retry job records success on the
-  target attempt row and returns successfully — the retry job is done.
-- If the target handler **fails**, the retry job records failure on the target
-  attempt row and returns an error — the retry job's own retry mechanism (its
-  `runWithRetry` loop) handles backoff and re-execution.
-
-This means the normal `runWithRetry` code path is shared: the retry job's
-execution is itself subject to `runWithRetry`, so backoff, lease heartbeating,
-graceful termination, and failure recording all work identically for retried
-jobs as for original jobs.
-
-#### Logic outline
-
-```
-__system:retry_job handler (one attempt = one target job handler invocation):
-  1. Load target job from DB (handler name, request, last attempt_no)
-  2. nextAttemptNo = last_attempt_no + 1
-  3. INSERT INTO job_attempts (job_id=target.id, attempt_no=nextAttemptNo, ...)
-     — this bypasses the normal claim-time max_attempts check; the retry job
-       is responsible for bounding total attempts via its own max_attempts.
-  4. Call w.runOnce(ctx, db, targetJob, targetAttempt)
-       runOnce: invoke handler once; call complete() on success, fail() on error.
-  5. If runOnce returns nil → target job is complete; return struct{}{}, nil
-     If runOnce returns error → return the error
-       → retry job's runWithRetry loop sleeps backoff, increments its own
-         attempt_no, and loops back to step 1 on the next retry job attempt.
-```
-
-`runOnce` is a helper extracted from `runWithRetry` that executes the handler a
-single time and records the result — `runWithRetry` is then a loop over
-`runOnce`. Both regular jobs and the retry job share this path.
-
-#### Code
+If the handler succeeds, the target job is marked complete. If it fails, the
+target job stays failed. A server crash or interruption during the retry means
+the attempt is lost; the user must manually trigger retry again.
 
 ```go
-// retryJobRequest is the request payload for the internal retry job.
-type retryJobRequest struct {
-    TargetJobID uuid.UUID `json:"target_job_id"`
-}
-
-// registerSystemJobs also registers the retry job handler.
-// (continued from the cancel_job registration above)
-s.Register("__system:retry_job", jobs.JobFn(func(ctx context.Context, req retryJobRequest) (struct{}, error) {
-    // Load target job and find the next attempt number.
+func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
+    // Load the target job.
     var targetJob Job
     var lastAttemptNo int
-    row := s.db.QueryRowContext(ctx,
+    row := api.db.QueryRowContext(ctx,
         `SELECT j.id, j.name, j.request, j.backoff_policy, j.deadline,
                 COALESCE(MAX(a.attempt_no), 0)
          FROM jobs j
          LEFT JOIN job_attempts a ON a.job_id = j.id
          WHERE j.id = $1
          GROUP BY j.id, j.name, j.request, j.backoff_policy, j.deadline`,
-        req.TargetJobID,
+        jobID,
     )
     if err := row.Scan(
         &targetJob.ID, &targetJob.Name, &targetJob.Request,
         &targetJob.BackoffPolicy, &targetJob.Deadline, &lastAttemptNo,
     ); err != nil {
-        return struct{}{}, fmt.Errorf("load target job: %w", err)
+        return fmt.Errorf("load target job: %w", err)
     }
 
     nextAttemptNo := lastAttemptNo + 1
 
-    // Insert the next attempt row for the target job directly, bypassing
-    // normal claim-time max_attempts validation. The retry job's own
-    // max_attempts bounds the total number of additional attempts.
-    if _, err := s.db.ExecContext(ctx,
+    // Insert a new attempt row, bypassing the normal max_attempts check.
+    if _, err := api.db.ExecContext(ctx,
         `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
          VALUES ($1, $2, $3, $4)`,
         targetJob.ID, nextAttemptNo, hostname, buildSHA,
     ); err != nil {
-        return struct{}{}, fmt.Errorf("insert target attempt: %w", err)
+        return fmt.Errorf("insert retry attempt: %w", err)
     }
 
-    targetAttempt := &Attempt{
+    attempt := &Attempt{
         JobID:     targetJob.ID,
         AttemptNo: nextAttemptNo,
         Request:   targetJob.Request,
-        // Note: no LeaseToken — the retry job holds the lease, not the target job.
     }
 
-    // Execute the target job's handler once, recording success/failure on the
-    // target job's attempt row. This shares the runOnce code path with normal
-    // job execution; the retry job's runWithRetry loop provides the outer retry.
-    if err := s.Worker.runOnce(ctx, s.db, &targetJob, targetAttempt); err != nil {
-        // Return the error so the retry job's own runWithRetry loop retries.
-        return struct{}{}, err
-    }
-    return struct{}{}, nil
-}))
-```
-
-When the retry job is dispatched, it sets `max_attempts` on itself equal to the
-original job's `max_attempts`, giving the target job a full second set of
-attempts:
-
-```go
-func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
-    // Look up the original job's max_attempts to size the retry budget.
-    var origMaxAttempts int
-    if err := api.db.QueryRowContext(ctx,
-        `SELECT max_attempts FROM jobs WHERE id = $1`, jobID,
-    ).Scan(&origMaxAttempts); err != nil {
-        return fmt.Errorf("load job: %w", err)
-    }
-
-    req, _ := json.Marshal(retryJobRequest{TargetJobID: jobID})
-    _, err := api.sys.Dispatch(ctx, api.db, "__system:retry_job", req,
-        fmt.Sprintf("retry:%s", jobID), // stable key; prevents duplicate retries
-        jobs.WithMaxAttempts(origMaxAttempts),
-    )
-    return err
+    // Execute the handler once. runOnce records success/failure on the
+    // attempt row and updates job_status accordingly.
+    return api.sys.runOnce(ctx, api.db, &targetJob, attempt)
 }
 ```
 
-Retried jobs can themselves be cancelled (via the cancel endpoint) and
-re-retried (by calling retry again). Re-retrying dispatches a new
-`__system:retry_job` with a fresh `max_attempts` budget.
+The retry is **not durable** — it runs in the handler's goroutine with no
+lease or claim. If the process dies mid-retry, the attempt row will have no
+`finished_at` and the job remains failed. The user can call retry again to
+make another attempt.
+
+---
+
+## Context Propagation
+
+Context fields (trace IDs, user IDs, logging attributes) often need
+to cross the job boundary — the caller's context carries values that
+should be present when the job executes, potentially on a different
+machine minutes later. The job system supports this through
+**context fields**: implementations of a single interface that own
+both extraction and injection logic for a given context value.
+
+Extracted values are stored in `metadata["system"]` on the job row,
+keyed by the struct's type name. At execution time, the system reads
+them back and calls each field's `Inject` to rebuild the context.
+
+### Interface
+
+```go
+// ContextField extracts a value from the caller's context at dispatch time
+// and injects it back into the execution context at run time.
+// Both methods use json.RawMessage so the implementer controls serialization.
+type ContextField interface {
+    Extract(ctx context.Context) json.RawMessage
+    Inject(ctx context.Context, data json.RawMessage) context.Context
+}
+```
+
+### Registration
+
+Fields are registered at startup. The system uses
+`reflect.TypeOf(field).Name()` as the storage key.
+
+```go
+func (js *System) RegisterContextField(field ContextField) {
+    key := reflect.TypeOf(field).Name()
+    js.contextFields[key] = field
+}
+```
+
+```go
+js.RegisterContextField(TraceIDField{})
+```
+
+### Extraction (dispatch time)
+
+When `Dispatch()` or `Run()` is called, the system runs all
+registered fields against the caller's context and writes non-nil
+results into `metadata["system"]`:
+
+```go
+func (js *System) extractContext(ctx context.Context, metadata map[string]any) map[string]any {
+    if metadata == nil {
+        metadata = make(map[string]any)
+    }
+    system := make(map[string]json.RawMessage)
+    for key, field := range js.contextFields {
+        data := field.Extract(ctx)
+        if data != nil {
+            system[key] = data
+        }
+    }
+    metadata["system"] = system
+    return metadata
+}
+```
+
+### Rehydration (execution time)
+
+Before invoking the handler, the system reads
+`metadata["system"]` and calls `Inject` for each registered field:
+
+```go
+func (js *System) rehydrateContext(ctx context.Context, metadata map[string]any) context.Context {
+    raw, ok := metadata["system"]
+    if !ok {
+        return ctx
+    }
+    system, ok := raw.(map[string]json.RawMessage)
+    if !ok {
+        return ctx
+    }
+    for key, data := range system {
+        field, ok := js.contextFields[key]
+        if !ok {
+            continue // field no longer registered — skip
+        }
+        ctx = field.Inject(ctx, data)
+    }
+    return ctx
+}
+```
+
+### Example: TraceIDField
+
+```go
+type TraceIDField struct{}
+
+func (TraceIDField) Extract(ctx context.Context) json.RawMessage {
+    traceID := trace.SpanFromContext(ctx).SpanContext().TraceID()
+    if !traceID.IsValid() {
+        return nil
+    }
+    data, _ := json.Marshal(traceID.String())
+    return data
+}
+
+func (TraceIDField) Inject(ctx context.Context, data json.RawMessage) context.Context {
+    var traceIDStr string
+    if err := json.Unmarshal(data, &traceIDStr); err != nil {
+        return ctx
+    }
+    traceID, err := trace.TraceIDFromHex(traceIDStr)
+    if err != nil {
+        return ctx
+    }
+    sc := trace.NewSpanContext(trace.SpanContextConfig{
+        TraceID:    traceID,
+        TraceFlags: trace.FlagsSampled,
+    })
+    return trace.ContextWithRemoteSpanContext(ctx, sc)
+}
+```
+
+### Storage
+
+The `metadata` column for a job with a registered `TraceIDField`:
+
+```json
+{
+  "system": {
+    "TraceIDField": "4bf92f3577b34da6a3ce929d0e0e4736"
+  },
+  "caller_supplied": "any other metadata"
+}
+```
+
+> **Note:** The storage key is the struct's type name. Renaming a
+> `ContextField` struct breaks injection for jobs already in the DB that were
+> stored under the old name.
 
 ---
 
@@ -1203,18 +1284,18 @@ in logs. Always use the `Context` variants of slog methods (`InfoContext`,
 log output.
 
 ```go
-func (w *Worker) execute(ctx context.Context, job *Job, attempt *Attempt) error {
+func (js *System) execute(ctx context.Context, job *Job, attempt *Attempt) error {
     log := slog.With("job_id", job.ID, "job_name", job.Name, "attempt_no", attempt.AttemptNo)
     log.InfoContext(ctx, "job started")
 
-    resp, err := w.registry[job.Name].Handle(ctx, attempt.Request)
+    resp, err := js.registry[job.Name].Handle(ctx, attempt.Request)
     if err != nil {
         log.ErrorContext(ctx, "job failed", "err", err)
         return err
     }
 
     log.InfoContext(ctx, "job completed")
-    return w.complete(ctx, attempt.ID, resp)
+    return js.complete(ctx, attempt.ID, resp)
 }
 ```
 
@@ -1229,7 +1310,7 @@ The worker emits OTel spans and metrics:
   - `jobs.queue_depth` — gauge of unclaimed jobs per namespace (sampled during claim polling)
 
 ```go
-func (w *Worker) execute(ctx context.Context, job *Job, attempt *Attempt) error {
+func (js *System) execute(ctx context.Context, job *Job, attempt *Attempt) error {
     ctx, span := tracer.Start(ctx, "job.execute",
         trace.WithAttributes(
             attribute.String("job.name", job.Name),
@@ -1263,16 +1344,16 @@ allow in-flight jobs to finish before the process exits.
 5. **Exit** — the process exits cleanly.
 
 ```go
-func (w *Worker) Shutdown() {
+func (js *System) Shutdown() {
     // 1. Stop the poll loop.
-    w.stopPoll()
+    js.stopPoll()
 
     const gracePeriod = 2 * time.Minute
 
     // 2. Wait for in-flight jobs to finish, up to the grace period.
     done := make(chan struct{})
     go func() {
-        w.activeWg.Wait()
+        js.activeWg.Wait()
         close(done)
     }()
 
@@ -1285,25 +1366,25 @@ func (w *Worker) Shutdown() {
     }
 
     // 3. Cancel contexts of all still-running jobs.
-    w.mu.Lock()
-    for _, entry := range w.activeJobs {
+    js.mu.Lock()
+    for _, entry := range js.activeJobs {
         entry.cancel()
     }
-    w.mu.Unlock()
+    js.mu.Unlock()
 
     // 4. Wait for all goroutines to exit after cancellation.
-    w.activeWg.Wait()
+    js.activeWg.Wait()
 
     // 5. Release leases for jobs that did not finish naturally.
     // Completed/failed jobs already deleted or released their leases inside runWithRetry;
     // only the context-cancelled jobs still hold leases at this point.
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
-    w.mu.Lock()
-    for _, entry := range w.activeJobs {
-        _ = w.leases.Release(ctx, w.db, entry.jobID.String(), entry.leaseToken)
+    js.mu.Lock()
+    for _, entry := range js.activeJobs {
+        _ = js.leases.Release(ctx, js.db, entry.jobID.String(), entry.leaseToken)
     }
-    w.mu.Unlock()
+    js.mu.Unlock()
 }
 ```
 
@@ -1313,14 +1394,14 @@ func (w *Worker) Shutdown() {
 sigCh := make(chan os.Signal, 1)
 signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 <-sigCh
-worker.Shutdown()
+js.Shutdown()
 ```
 
 ### Interaction with Local Retry
 
 Because the worker retains leases during transient failures and retries
 locally, graceful termination must account for jobs that are currently sleeping
-between retry attempts. These jobs are tracked in `w.activeJobs` alongside
+between retry attempts. These jobs are tracked in `js.activeJobs` alongside
 actively-executing jobs. Cancelling their context in step 3 wakes them from the
 backoff `select` in `runWithRetry`, which triggers an immediate
 `leases.Release` before the goroutine exits.
@@ -1346,19 +1427,19 @@ application internals.
 
 func wire(db *pgxpool.Pool, mailer *Mailer, billingClient *BillingClient) *jobs.System {
     // Namespace is configured once on the System; it is not a per-call argument.
-    sys := jobs.NewSystem(db, leaseStore, jobs.WorkerConfig{
+    sys := jobs.NewSystem(db, leaseStore, jobs.Config{
         Namespace:    "default",
         BatchSize:    10,
         PollInterval: 2 * time.Second,
     })
 
-    sys.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
+    syjs.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
         return mailer.Send(ctx, req.Email, welcomeTemplate)
     }))
-    sys.Register("charge_subscription", jobs.JobFn(func(ctx context.Context, req ChargeRequest) (ChargeResponse, error) {
+    syjs.Register("charge_subscription", jobs.JobFn(func(ctx context.Context, req ChargeRequest) (ChargeResponse, error) {
         return billingClient.Charge(ctx, req)
     }))
-    sys.Register("cleanup_expired_sessions", jobs.JobFn(func(ctx context.Context, req CleanupRequest) (CleanupResponse, error) {
+    syjs.Register("cleanup_expired_sessions", jobs.JobFn(func(ctx context.Context, req CleanupRequest) (CleanupResponse, error) {
         return cleanupSessions(ctx, db, req)
     }))
 
@@ -1374,7 +1455,7 @@ wired in one central file:
 // jobs/send_welcome_email.go
 
 func Register(sys *jobs.System, mailer *Mailer) {
-    sys.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
+    syjs.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
         msgID, err := mailer.Send(ctx, req.Email, welcomeTemplate)
         if err != nil {
             return SendWelcomeEmailResponse{}, err
@@ -1427,10 +1508,10 @@ CREATE TABLE job_attempt_history (LIKE job_attempts INCLUDING ALL);
 The archival job runs as a registered system job on a nightly cron schedule:
 
 ```go
-s.Register("__system:archive_jobs", jobs.JobFn(func(ctx context.Context, req struct{}) (struct{}, error) {
+js.Register("__system:archive_jobs", jobs.JobFn(func(ctx context.Context, req struct{}) (struct{}, error) {
     cutoff := time.Now().UTC().AddDate(0, 0, -30)
 
-    tx, err := s.db.BeginTx(ctx, nil)
+    tx, err := js.db.BeginTx(ctx, nil)
     if err != nil {
         return struct{}{}, err
     }
@@ -1558,17 +1639,17 @@ view, which derives state from `jobs` and `job_attempts`.
 
 | Event | Status written | Where |
 |---|---|---|
-| Worker claims lease + inserts attempt | `running` | Inside `claimBatch` tx |
+| System claims lease + inserts attempt | `running` | Inside `claimBatch` tx |
 | Job completes successfully | `completed` | Inside `complete()` tx |
 | Transient failure (retry remaining) | _(no change — stays `running`)_ | — |
 | Permanent failure (no retries) | `failed` | Inside `fail()` tx |
 | Job cancelled | `failed` | Inside `__system:cancel_job` tx |
-| Manual retry dispatched | `running` | Inside `__system:retry_job` tx |
+| Manual retry dispatched | `running` | Inside `Retry()` handler |
 
 Example — updating status inside `complete()`:
 
 ```go
-func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
+func (js *System) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
     _, err := tx.Exec(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -1588,7 +1669,7 @@ func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attem
         return err
     }
 
-    return w.leases.Delete(ctx, tx, job.ID.String())
+    return js.leases.Delete(ctx, tx, job.ID.String())
 }
 ```
 
@@ -1714,8 +1795,8 @@ This reduces connection usage from O(N) to O(1) per tick. Callers block on a
 channel instead of holding a connection:
 
 ```go
-func (p *Publisher) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
-    ch := p.poller.Subscribe(jobID, false)
+func (js *System) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
+    ch := js.poller.Subscribe(jobID, false)
     select {
     case <-ctx.Done():
         return ctx.Err()
