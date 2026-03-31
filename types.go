@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/carloruiz/leases"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -83,5 +84,5 @@ type Attempt struct {
 	FinishedAt   *time.Time
 	ExecutorHost string
 	ExecutorSHA  string
-	LeaseToken   string
+	LeaseToken   leases.LeaseToken
 }
