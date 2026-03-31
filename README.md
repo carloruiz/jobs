@@ -2,17 +2,25 @@
 
 ## Overview
 
-This library provides a durable job execution system backed by CockroachDB. Its purpose is to ensure jobs complete reliably despite system crashes and transient failures, while remaining simple enough for a small team to own and operate.
+This library provides a durable job execution system backed by CockroachDB. Its
+purpose is to ensure jobs complete reliably despite system crashes and
+transient failures, while remaining simple enough for a small team to own and
+operate.
 
-The system is intentionally modest in scope. It is designed to handle business logic jobs — both user-triggered events and scheduled cron jobs — at a scale appropriate for a fast-growing product over roughly two years. After that point, you are expected to outgrow it and migrate to a more capable system.
+The system is intentionally modest in scope. It is designed to handle business
+logic jobs — both user-triggered events and scheduled cron jobs — at a scale
+appropriate for a fast-growing product over roughly two years. After that
+point, you are expected to outgrow it and migrate to a more capable system.
 
 **This system is well-suited for:**
 - User-triggered events (e.g. send welcome email, provision account)
 - Background cron jobs (e.g. nightly billing, data cleanup)
-- Workloads with modest concurrency (hundreds of concurrent jobs, not thousands)
+- Workloads with modest concurrency (hundreds of concurrent jobs, not
+  thousands)
 
 **This system is not suited for:**
-- Big data pipelines or batch workloads where job volume can exceed thousands concurrently
+- Big data pipelines or batch workloads where job volume can exceed thousands
+  concurrently
 - Workloads requiring strict FIFO ordering across namespaces
 - Workloads requiring priority scheduling
 - Real-time job dispatch with sub-second latency requirements
@@ -27,7 +35,7 @@ This is a deliberately minimal system. The following features are absent by desi
 |---|---|
 | Priority scheduling | All jobs within a namespace are treated equally. High-priority work must use a dedicated namespace and worker pool. |
 | FIFO ordering guarantees | Jobs are claimed in an approximate order but no strict ordering is enforced across workers. |
-| Fan-out / chaining | No built-in support for job DAGs or spawning child jobs. |
+| Fan-out / chaining | No first-class support for job DAGs or spawning child jobs. |
 | Rate limiting per job type | Workers claim up to a configured limit but there is no per-type throttle. |
 | Multi-tenant isolation | All workers share the same tables; logical separation is by namespace only. |
 
@@ -37,30 +45,50 @@ This is a deliberately minimal system. The following features are absent by desi
 
 ### Guarantees
 
-- **At-least-once execution**: Every job will be attempted at least once. Lease expiry ensures stalled jobs are re-claimed by another worker.
-- **Local retry preference**: On transient failure, the executing worker retains the lease and retries the job locally after the configured backoff. The lease is only released to the pool on graceful termination. This minimizes unnecessary claim contention and preserves handler locality (in-process state, local caches).
-- **No silent drops**: Unknown job types are logged and released, never silently ignored.
-- **Durable state**: All job and attempt state is persisted in CockroachDB before execution begins.
+- **At-least-once execution**: Every job will be attempted at least once. Lease
+  expiry ensures stalled jobs are re-claimed by another worker.
+- **Local retry preference**: On transient failure, the executing worker
+  retains the lease and retries the job locally after the configured backoff.
+  The lease is only released to the pool on graceful termination. This
+  minimizes unnecessary claim contention and preserves handler locality
+  (in-process state, local caches).
+- **No silent drops**: Unknown job types are logged and released, never
+  silently ignored.
+- **Durable state**: All job and attempt state is persisted in CockroachDB
+  before execution begins.
 
 ### Requirements
 
-- **Jobs must be idempotent**: Because a job may be retried after a partial execution (e.g. a worker crash mid-handler), handlers must be safe to run more than once with the same input. Use database-level upserts or external idempotency keys where necessary.
+- **Jobs must be idempotent**: Because a job may be retried after a partial
+  execution (e.g. a worker crash mid-handler), handlers must be safe to run
+  more than once with the same input. Use database-level upserts or external
+  idempotency keys where necessary.
 
 ### Notes
 
-- **Checkpointing**: There is no mechanism for a long-running handler to save intermediate progress. If a handler is interrupted mid-way, it restarts from scratch. Checkpointing is a potential future feature.
-- **Failure hooks**: Callers can register a callback that runs once a job has permanently failed (exhausted all retries). This hook is called exactly once, after the final failed attempt is recorded.
-- **TODO**: What happens when a server crashes on the last job attempt? The lease will eventually expire, and a new worker will claim the job. But `attempt_no` will already equal `max_attempts`, so the job will be marked permanently failed without executing. Is this the right behavior? Consider whether to count "did not finish" separately from "failed with an error".
+- **Checkpointing**: Though there is not explicity first-class support for 
+  checkpointing, checkpointing can be achieved by embedding jobs within other 
+  jobs. First-class support for checkpointing can be a follow up.
+- **Failure hooks**: Callers can register a callback that runs once a job has
+  permanently failed (exhausted all retries). This hook is called exactly once,
+  after the final failed attempt is recorded.
+- **TODO**: What happens when a server crashes on the last job attempt? The
+  lease will eventually expire, and a new worker will claim the job. But
+  `attempt_no` will already equal `max_attempts`, so the job will be marked
+  permanently failed without executing. Is this the right behavior? Consider
+  whether to count "did not finish" separately from "failed with an error".
 
 ---
 
 ## Data Model
 
-Three tables form the foundation: `jobs`, `job_attempts`, and `leases`.
+Three tables form the foundation: `jobs`, `job_attempts`.
 
 ### `jobs`
 
-An append-only log of work to be done. Each row represents one unit of work and is immutable after insertion. Jobs are partitioned logically by `name` (the job type) and `namespace` (the named namespace).
+An append-only log of work to be done. Each row represents one unit of work and
+is immutable after insertion. Jobs are partitioned logically by `name` (the job
+type) and `namespace` (the named namespace).
 
 ```sql
 CREATE TABLE jobs (
@@ -68,15 +96,14 @@ CREATE TABLE jobs (
     idempotency_key  TEXT        NOT NULL,               -- deduplication key; auto-generated if not supplied
     name             TEXT        NOT NULL,               -- job type identifier
     namespace        TEXT        NOT NULL,               -- logical grouping
+    metadata         JSONB,                              -- arbitrary caller-supplied key-value pairs
+    request          JSONB       NOT NULL,               -- input payload (max 1MB)
     max_attempts     INT         NOT NULL,
-    backoff_policy   JSONB       NOT NULL,               -- per-attempt delay config (e.g. {"delay_seconds": [5, 30, 300]})
-    deadline         TIMESTAMPTZ,                        -- optional; job is skipped after this
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     creator_sha      TEXT        NOT NULL,               -- git SHA of the service that dispatched
     creator_host     TEXT        NOT NULL,               -- hostname of the service that dispatched
-    metadata         JSONB,                              -- arbitrary caller-supplied key-value pairs
-    logging_context  JSONB,                              -- logging fields to propagate into job execution
-    request          JSONB       NOT NULL,               -- input payload (max 1MB)
+    backoff_policy   JSONB       NOT NULL,               -- per-attempt delay config (e.g. {"delay_seconds": [5, 30, 300]})
+    deadline         TIMESTAMPTZ,                        -- optional; job is skipped after this
 
     UNIQUE (name, idempotency_key)    -- scoped per job type
 );
@@ -86,7 +113,11 @@ CREATE INDEX ON jobs (namespace, name, created_at);
 
 ### `job_attempts`
 
-An append-only log of every execution. Each attempt corresponds to one try at executing a job. Attempts use `(job_id, attempt_no)` as the primary key so that rows for the same job are stored contiguously on disk, achieving the same proximity benefit that `INTERLEAVE IN PARENT` provided without the deprecated feature.
+An append-only log of every execution. Each attempt corresponds to one try at
+executing a job. Attempts use `(job_id, attempt_no)` as the primary key so that
+rows for the same job are stored contiguously on disk, achieving the same
+proximity benefit that `INTERLEAVE IN PARENT` provided without the deprecated
+feature.
 
 ```sql
 CREATE TABLE job_attempts (
@@ -104,28 +135,21 @@ CREATE TABLE job_attempts (
 );
 ```
 
-> **Payload limit:** Request payloads are stored on the `jobs` table (max 1MB). Response payloads on `job_attempts` are also capped at 1MB. Larger payloads should be stored externally (e.g. object storage) with a reference URI in the job request.
+> **Payload limit:** Request payloads are stored on the `jobs` table (max 1MB).
+> Response payloads on `job_attempts` are also capped at 1MB. Larger payloads
+> should be stored externally (e.g. object storage) with a reference URI in the
+> job request.
 
-> **Why JSONB?** Payloads are human-readable directly in any SQL client without additional tooling. They are also queryable via JSON operators, enabling ad-hoc investigation (e.g. `WHERE request->>'user_id' = '123'`). Binary encoding (e.g. protobuf) is explicitly avoided — see the Serialization section for rationale.
-
-### `leases`
-
-A heartbeat table managed by the external `leases` library. One row exists per active job claim. The job system creates a lease row when a job is dispatched and deletes it on completion, permanent failure, or cancellation.
-
-```sql
--- Managed by the leases library; schema shown for reference.
-CREATE TABLE leases (
-    resource    TEXT        PRIMARY KEY,    -- job_id
-    group_name  TEXT        NOT NULL,       -- namespace name
-    owner       TEXT        NOT NULL,       -- worker identity (host + process)
-    token       UUID        NOT NULL,       -- fencing token; changes on each acquire
-    expires_at  TIMESTAMPTZ NOT NULL
-);
-```
+> **Why JSONB?** Payloads are human-readable directly in any SQL client without
+> additional tooling. They are also queryable via JSON operators, enabling
+> ad-hoc investigation (e.g. `WHERE request->>'user_id' = '123'`). Binary
+> encoding (e.g. protobuf) is explicitly avoided — see the Serialization
+> section for rationale.
 
 ### `jobs_overview` Debug View
 
-The canonical way to observe job state. Joins `jobs` with the most recent attempt, including jobs that have never been attempted.
+The canonical way to observe job state. Joins `jobs` with the most recent
+attempt, including jobs that have never been attempted.
 
 ```sql
 CREATE VIEW jobs_overview AS
@@ -180,13 +204,25 @@ This view is used for debugging, not for claim logic.
 
 ### Dispatching a Job
 
-`Publisher` is the struct responsible for dispatching jobs. `Dispatch()` creates the job row and, if no conflict is found, **prefers local execution**: it immediately acquires the lease and runs the handler in a goroutine, rather than creating an unlocked lease and waiting for a worker to claim it. If a conflict is found (same idempotency key), `Dispatch()` checks whether the existing job is actively running; if it is, it polls for the result and returns it. `Run()` does the same but blocks until completion.
+`Publisher` is the struct responsible for dispatching jobs. `Dispatch()`
+creates the job row and, if no conflict is found, **prefers local execution**:
+it immediately acquires the lease and runs the handler in a goroutine, rather
+than creating an unlocked lease and waiting for a worker to claim it. If a
+conflict is found (same idempotency key), `Dispatch()` checks whether the
+existing job is actively running; if it is, it polls for the result and returns
+it. `Run()` does the same but blocks until completion.
 
-Preferring local execution in `Dispatch()` avoids a round-trip through the claim poll cycle: the dispatching process acts as both publisher and executor. Falling back to an unlocked lease (async worker claim) only occurs when local execution cannot proceed — for example, when a race prevents immediate lease acquisition.
+Preferring local execution in `Dispatch()` avoids a round-trip through the
+claim poll cycle: the dispatching process acts as both publisher and executor.
+Falling back to an unlocked lease (async worker claim) only occurs when local
+execution cannot proceed — for example, when a race prevents immediate lease
+acquisition.
 
-Namespace is a system-wide configuration (set on `Worker` / `System` at startup) and is not a per-call parameter.
+Namespace is a system-wide configuration (set on `Worker` / `System` at
+startup) and is not a per-call parameter.
 
-A top-level `System` struct composes both `Publisher` and `Worker`, promoting their methods for convenience.
+A top-level `System` struct composes both `Publisher` and `Worker`, promoting
+their methods for convenience.
 
 ```go
 // System is the top-level entry point. Publisher and Worker are promoted.
@@ -203,34 +239,50 @@ type Publisher struct {
 }
 ```
 
-Full implementation details — including idempotency key handling, deduplication behavior, and the `Run()` polling path for duplicate keys — are in the [Idempotency Key](#idempotency-key) section below.
+Full implementation details — including idempotency key handling, deduplication
+behavior, and the `Run()` polling path for duplicate keys — are in the
+[Idempotency Key](#idempotency-key) section below.
 
 ### Idempotency Key
 
-Every job row carries an `idempotency_key`. Its purpose is to prevent duplicate jobs from being created when a caller retries a failed `Dispatch()` or `Run()` call (e.g. due to a network timeout after the INSERT succeeded).
+Every job row carries an `idempotency_key`. Its purpose is to prevent duplicate
+jobs from being created when a caller retries a failed `Dispatch()` or `Run()`
+call (e.g. due to a network timeout after the INSERT succeeded).
 
 **Rules:**
-- For `Dispatch()`: `idempotencyKey` is optional. Pass `""` to auto-generate a UUID, opting out of deduplication — safe for fire-and-forget callers that do not retry.
-- For `Run()`: `idempotencyKey` is **required** (non-empty). `Run()` blocks until the job completes; if the caller retries after a timeout, the second call polls for the result of the first execution rather than launching a duplicate.
+- For `Dispatch()`: `idempotencyKey` is optional. Pass `""` to auto-generate a
+  UUID, opting out of deduplication — safe for fire-and-forget callers that do
+  not retry.
+- For `Run()`: `idempotencyKey` is **required** (non-empty). `Run()` blocks
+  until the job completes; if the caller retries after a timeout, the second
+  call polls for the result of the first execution rather than launching a
+  duplicate.
 
 **Signatures:**
 
 ```go
 // Dispatch creates the job row and prefers to acquire the lease and run the handler
-// locally in a goroutine. If the job already exists and is actively running, Dispatch
-// polls job_status until the job reaches a terminal state and returns.
-// If the job exists but is not running (pending), Dispatch returns immediately and the
-// async worker claim path handles execution.
+// locally in a goroutine. If the job already exists, Dispatch polls job_status until
+// the job reaches a terminal state and returns.
 // req must be a valid JSON-encoded payload.
-func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string) (*Job, error) {
+func (p *Publisher) Dispatch(
+    ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string,
+) (*Job, error) {
     key := idempotencyKey
     if key == "" {
         key = uuid.NewString()
     }
 
+    // Begin a transaction (or savepoint if db is already a pgx.Tx).
+    tx, err := db.Begin(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
     var job Job
     var isNew bool
-    err := db.QueryRowContext(ctx, `
+    err = tx.QueryRow(ctx, `
         INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
@@ -242,41 +294,34 @@ func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req json
     }
 
     if !isNew {
-        // Job already exists. Check whether it is actively running (lease is held).
-        acquired, err := p.leases.IsAcquired(ctx, db, job.ID.String())
-        if err != nil {
-            return nil, fmt.Errorf("check lease: %w", err)
+        if err := tx.Commit(ctx); err != nil {
+            return nil, fmt.Errorf("commit: %w", err)
         }
-        if acquired {
-            // Another worker (or goroutine) is running this job — poll for result.
-            if err := p.pollForCompletion(ctx, db, job.ID); err != nil {
-                return nil, err
-            }
-        }
-        // Job is pending but not claimed — return immediately; async claim will handle it.
         return &job, nil
     }
 
-    // Newly created job: prefer local execution. Attempt to acquire the lease immediately.
-    lease, err := p.leases.CreateAndAcquire(ctx, db, p.namespace, job.ID.String(), hostname, leaseDuration)
+    // Newly created job: create and acquire the lease atomically with the job row.
+    lease, err := p.leases.CreateAndAcquire(ctx, tx, p.namespace, job.ID.String(), hostname, leaseDuration)
     if err != nil {
-        // Could not acquire (e.g. race with another process). Fall back to unlocked lease
-        // so the async worker poll loop picks it up.
-        if _, createErr := p.leases.Create(ctx, db, p.namespace, job.ID.String()); createErr != nil {
-            return nil, fmt.Errorf("create lease: %w", createErr)
-        }
-        return &job, nil
+        return nil, fmt.Errorf("create and acquire lease: %w", err)
     }
 
-    // Lease acquired: insert the first attempt row and run the handler in a goroutine.
+    // Insert the first attempt row.
     attempt := &Attempt{JobID: job.ID, AttemptNo: 1, LeaseToken: lease.Token}
-    if _, err = db.ExecContext(ctx,
+    if _, err = tx.Exec(ctx,
         `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
          VALUES ($1, 1, $2, $3)`,
         job.ID, hostname, buildSHA,
     ); err != nil {
         return nil, fmt.Errorf("insert attempt: %w", err)
     }
+
+    if err := tx.Commit(ctx); err != nil {
+        return nil, fmt.Errorf("commit: %w", err)
+    }
+
+    // TODO: we should be using the job system context but after extracting
+    // relevant context fields.
     go p.worker.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
 
     return &job, nil
@@ -285,15 +330,25 @@ func (p *Publisher) Dispatch(ctx context.Context, db DBTX, name string, req json
 // Run creates the job, acquires the lease locally, and executes the handler in-process.
 // idempotencyKey is required. If a job with this (name, key) already exists, Run polls
 // job_status until the job reaches a terminal state, then returns the result.
-// req must be a valid JSON-encoded payload.
-func (s *System) Run(ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string) (json.RawMessage, error) {
+// req must be a valid JSON-encoded payload. dest is a pointer to the response type that
+// the result will be unmarshaled into.
+func (s *System) Run(
+    ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string, dest any,
+) error {
     if idempotencyKey == "" {
-        return nil, fmt.Errorf("Run: idempotencyKey is required")
+        return fmt.Errorf("Run: idempotencyKey is required")
     }
+
+    // Begin a transaction (or savepoint if db is already a pgx.Tx).
+    tx, err := db.Begin(ctx)
+    if err != nil {
+        return fmt.Errorf("begin tx: %w", err)
+    }
+    defer tx.Rollback(ctx)
 
     var job Job
     var isNew bool
-    err := db.QueryRowContext(ctx, `
+    err = tx.QueryRow(ctx, `
         INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id
@@ -301,35 +356,50 @@ func (s *System) Run(ctx context.Context, db DBTX, name string, req json.RawMess
         uuid.New(), idempotencyKey, name, s.namespace, buildSHA, hostname, req,
     ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace, &isNew)
     if err != nil {
-        return nil, fmt.Errorf("insert job: %w", err)
+        return fmt.Errorf("insert job: %w", err)
     }
 
     if !isNew {
-        // Job already exists — poll until terminal, then return the stored result.
-        return s.pollForResult(ctx, db, job.ID)
+        if err := tx.Commit(ctx); err != nil {
+            return fmt.Errorf("commit: %w", err)
+        }
+        // Job already exists — poll until terminal, then unmarshal the stored result.
+        raw, err := s.pollForResult(ctx, db, job.ID)
+        if err != nil {
+            return err
+        }
+        return json.Unmarshal(raw, dest)
     }
 
     // Newly created job: acquire the lease locally and execute in-process.
-    if _, err := s.leases.CreateAndAcquire(ctx, db, s.namespace, job.ID.String(), hostname, leaseDuration); err != nil {
-        return nil, fmt.Errorf("create and acquire lease: %w", err)
+    if _, err := s.leases.CreateAndAcquire(ctx, tx, s.namespace, job.ID.String(), hostname, leaseDuration); err != nil {
+        return fmt.Errorf("create and acquire lease: %w", err)
     }
 
     attempt := &Attempt{JobID: job.ID, AttemptNo: 1}
-    if _, err = db.ExecContext(ctx,
+    if _, err = tx.Exec(ctx,
         `INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
          VALUES ($1, 1, $2, $3)`,
         job.ID, hostname, buildSHA,
     ); err != nil {
-        return nil, fmt.Errorf("insert attempt: %w", err)
+        return fmt.Errorf("insert attempt: %w", err)
     }
 
-    return s.Worker.runWithRetry(ctx, db, &job, attempt)
+    if err := tx.Commit(ctx); err != nil {
+        return fmt.Errorf("commit: %w", err)
+    }
+
+    raw, err := s.Worker.runWithRetry(ctx, db, &job, attempt)
+    if err != nil {
+        return err
+    }
+    return json.Unmarshal(raw, dest)
 }
 
 // pollForCompletion polls job_status until the job reaches a terminal state.
 // Used by Dispatch() when a running duplicate is detected.
 func (p *Publisher) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUID) error {
-    ticker := time.NewTicker(500 * time.Millisecond)
+    ticker := time.NewTicker(1 * time.Second)
     defer ticker.Stop()
     for {
         select {
@@ -356,6 +426,7 @@ func (p *Publisher) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.U
 
 // pollForResult polls job_status until the job reaches a terminal state,
 // then fetches the response from job_attempts. Used by Run() for duplicate detection.
+// See the Optimizations section for an optimized implementation of polling results
 func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (json.RawMessage, error) {
     ticker := time.NewTicker(500 * time.Millisecond)
     defer ticker.Stop()
@@ -391,9 +462,15 @@ func (s *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (j
 
 **Deduplication behavior:**
 
-`Dispatch()` uses `INSERT ... ON CONFLICT (name, idempotency_key) DO UPDATE SET id = jobs.id`. If a row already exists for the `(name, key)` pair, the insert is a no-op and the existing job is returned unchanged. The caller receives the same job ID on every call with the same key.
+`Dispatch()` uses `INSERT ... ON CONFLICT (name, idempotency_key) DO UPDATE SET
+id = jobs.id`. If a row already exists for the `(name, key)` pair, the insert
+is a no-op and the existing job is returned unchanged. The caller receives the
+same job ID on every call with the same key.
 
-`Run()` additionally detects whether the INSERT created a new row (via `xmax = 0`). If a conflict was found, `Run()` blocks in `pollForResult` until the original execution completes, then returns its stored response — so a caller retrying a timed-out `Run()` does not launch a duplicate.
+`Run()` additionally detects whether the INSERT created a new row (via `xmax =
+0`). If a conflict was found, `Run()` blocks in `pollForResult` until the
+original execution completes, then returns its stored response — so a caller
+retrying a timed-out `Run()` does not launch a duplicate.
 
 **Choosing an idempotency key:**
 
@@ -488,11 +565,19 @@ func (w *Worker) claimBatch(ctx context.Context) ([]*Attempt, error) {
 
 Before executing, each claimed job is validated:
 
-1. **Registered job type** — if `name` is not in the local registry, the job is released and skipped. This is safe when the number of job types is small (< ~30).
-2. **Max attempts** — if `nextAttemptNo > max_attempts`, the job is marked permanently failed and the lease is deleted.
-3. **Deadline** — if `deadline` is non-nil and has passed, the job is marked failed with reason `"deadline exceeded"` and the lease is deleted.
-4. **Backoff** — if the elapsed time since the previous attempt's `started_at` is less than the configured delay, the lease is released and the job is skipped until the next poll cycle.
-5. **Stale job guard (dev only)** — in local development environments, jobs older than a configurable threshold are skipped to prevent re-executing stale work from a previous session.
+1. **Registered job type** — if `name` is not in the local registry, the job is
+   released and skipped. This is safe when the number of job types is small (<
+   ~30).
+2. **Max attempts** — if `nextAttemptNo > max_attempts`, the job is marked
+   permanently failed and the lease is deleted.
+3. **Deadline** — if `deadline` is non-nil and has passed, the job is marked
+   failed with reason `"deadline exceeded"` and the lease is deleted.
+4. **Backoff** — if the elapsed time since the previous attempt's `started_at`
+   is less than the configured delay, the lease is released and the job is
+   skipped until the next poll cycle.
+5. **Stale job guard (dev only)** — in local development environments, jobs
+   older than a configurable threshold are skipped to prevent re-executing
+   stale work from a previous session.
 
 ```go
 func (w *Worker) validate(job *Job, nextAttemptNo int) error {
@@ -516,7 +601,9 @@ func (w *Worker) validate(job *Job, nextAttemptNo int) error {
 
 ## Execution and State Management
 
-Job state is not stored as an explicit column. It is derived from the relationship between `jobs` and `job_attempts` (see `jobs_overview` view above).
+Job state is not stored as an explicit column. It is derived from the
+relationship between `jobs` and `job_attempts` (see `jobs_overview` view
+above).
 
 ### Execution Flow
 
@@ -526,12 +613,21 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
 ```
 
 1. Worker claims a batch of leases (in a transaction).
-2. In the same transaction, for each lease, the job is validated and a new `job_attempts` row is inserted. The lease acquisition and attempt insertion are atomic.
+2. In the same transaction, for each lease, the job is validated and a new
+   `job_attempts` row is inserted. The lease acquisition and attempt insertion
+   are atomic.
 3. The transaction commits. The handler is invoked with the request payload.
-4. On success: the `response` and `finished_at` columns are written in a transaction; the lease is deleted in the same transaction.
-5. On transient failure: the `error` and `finished_at` columns are written on the current attempt; **the lease is retained**. The worker sleeps for the configured backoff duration, inserts a new `job_attempts` row, and re-executes the handler locally — no other worker can claim the job while this worker holds the lease.
-6. On permanent failure (no attempts remaining): the `error` and `finished_at` columns are written; the lease is deleted.
-7. On graceful termination: leases for any in-flight jobs are released, allowing another worker to re-claim them.
+4. On success: the `response` and `finished_at` columns are written in a
+   transaction; the lease is deleted in the same transaction.
+5. On transient failure: the `error` and `finished_at` columns are written on
+   the current attempt; **the lease is retained**. The worker sleeps for the
+   configured backoff duration, inserts a new `job_attempts` row, and
+   re-executes the handler locally — no other worker can claim the job while
+   this worker holds the lease.
+6. On permanent failure (no attempts remaining): the `error` and `finished_at`
+   columns are written; the lease is deleted.
+7. On graceful termination: leases for any in-flight jobs are released,
+   allowing another worker to re-claim them.
 
 ### Writing the Response
 
@@ -661,17 +757,31 @@ if time.Now().Before(nextAllowedAt) {
 
 ## Serialization and Typed Job Contracts
 
-**Invariant: all request and response payloads must be valid JSON.** This is enforced at every public interface boundary:
+**Invariant: all request and response payloads must be valid JSON.** This is
+enforced at every public interface boundary:
 
-- `Dispatch(req json.RawMessage, ...)` and `Run(req json.RawMessage, ...)` accept `json.RawMessage`, which is a named `[]byte` type that signals the JSON contract to callers. Passing non-JSON bytes is a programming error; the system validates the payload is non-nil and well-formed before inserting it.
-- Handlers registered via `JobFn` automatically produce valid JSON responses via `json.Marshal`. Custom `Handler` implementations that produce raw bytes must ensure their output is valid JSON — this is checked at registration time with a sentinel validation.
-- The `request` and `response` columns are typed `JSONB` in CockroachDB, which enforces validity at the database level as a final backstop.
+- `Dispatch(req json.RawMessage, ...)` and `Run(req json.RawMessage, ...)`
+  accept `json.RawMessage`, which is a named `[]byte` type that signals the
+  JSON contract to callers. Passing non-JSON bytes is a programming error; the
+  system validates the payload is non-nil and well-formed before inserting it.
+- Handlers registered via `JobFn` automatically produce valid JSON responses
+  via `json.Marshal`. Custom `Handler` implementations that produce raw bytes
+  must ensure their output is valid JSON — this is checked at registration time
+  with a sentinel validation.
+- The `request` and `response` columns are typed `JSONB` in CockroachDB, which
+  enforces validity at the database level as a final backstop.
 
-The job system's internal boundary carries `json.RawMessage` (not `[]byte`) to make this contract explicit throughout the call stack. Any handler that returns something that is not valid JSON will receive a registration-time panic, not a silent runtime failure.
+The job system's internal boundary carries `json.RawMessage` (not `[]byte`) to
+make this contract explicit throughout the call stack. Any handler that returns
+something that is not valid JSON will receive a registration-time panic, not a
+silent runtime failure.
 
 ### JobFn
 
-Each job type defines its own `Request` and `Response` structs. `JobFn` is a generic adapter that handles JSON marshaling/unmarshaling centrally. Individual handlers receive and return concrete Go types; JSON encoding/decoding is never their responsibility.
+Each job type defines its own `Request` and `Response` structs. `JobFn` is a
+generic adapter that handles JSON marshaling/unmarshaling centrally. Individual
+handlers receive and return concrete Go types; JSON encoding/decoding is never
+their responsibility.
 
 ```go
 // JobFn adapts a typed function to the internal json.RawMessage boundary.
@@ -729,7 +839,12 @@ if err != nil {
 _, err = sys.Dispatch(ctx, db, "send_welcome_email", json.RawMessage(req), "")
 ```
 
-> **Why not proto?** Protobuf makes job attempt rows opaque in the database, requiring additional tooling to inspect payloads. At this stage, the maintenance overhead of `.proto` files and generated code is not justified. JSON via `JobFn` provides equivalent compile-time type safety with full debuggability in any SQL client at zero extra cost. The JSON invariant is enforced at every layer, so there is no safety trade-off.
+> **Why not proto?** Protobuf makes job attempt rows opaque in the database,
+> requiring additional tooling to inspect payloads. At this stage, the
+> maintenance overhead of `.proto` files and generated code is not justified.
+> JSON via `JobFn` provides equivalent compile-time type safety with full
+> debuggability in any SQL client at zero extra cost. The JSON invariant is
+> enforced at every layer, so there is no safety trade-off.
 
 ---
 
@@ -755,16 +870,24 @@ type Store interface {
 }
 ```
 
-- `Create`: called during `Dispatch()` to create an unlocked lease for asynchronous worker claim.
-- `CreateAndAcquire`: called during `Run()` to atomically create and hold the lease locally, preventing other workers from claiming it.
-- `Delete`: called on job completion, permanent failure, or cancellation to remove the lease row entirely.
+- `Create`: called during `Dispatch()` to create an unlocked lease for
+  asynchronous worker claim.
+- `CreateAndAcquire`: called during `Run()` to atomically create and hold the
+  lease locally, preventing other workers from claiming it.
+- `Delete`: called on job completion, permanent failure, or cancellation to
+  remove the lease row entirely.
 - `AcquireMany`: called during the claim loop to grab available leases.
-- `Release`: called only during graceful termination so another worker can re-claim in-flight jobs. On transient failure, the lease is **retained** — the worker retries locally without releasing.
-- `HeartbeatMany`: called periodically by a background goroutine to keep active claims alive.
+- `Release`: called only during graceful termination so another worker can
+  re-claim in-flight jobs. On transient failure, the lease is **retained** —
+  the worker retries locally without releasing.
+- `HeartbeatMany`: called periodically by a background goroutine to keep active
+  claims alive.
 
 ### Heartbeat Loop
 
-A background goroutine sends heartbeats for all currently-held leases. If heartbeats fail consistently (e.g. DB unavailable), the worker self-terminates to release all claims via lease expiry.
+A background goroutine sends heartbeats for all currently-held leases. If
+heartbeats fail consistently (e.g. DB unavailable), the worker self-terminates
+to release all claims via lease expiry.
 
 ```go
 func (w *Worker) heartbeatLoop(ctx context.Context) {
@@ -805,11 +928,20 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 
 ## Cancellation and Signals
 
-Job cancellation is handled by a special system-internal `__system:cancel_job`. When a cancel request arrives at the HTTP API, the system dispatches a `__system:cancel_job` via `Run()` (synchronously in-process). The cancel job is generic — it can cancel any target job — and its implementation is entirely internal to the job system.
+Job cancellation is handled by a special system-internal `__system:cancel_job`.
+When a cancel request arrives at the HTTP API, the system dispatches a
+`__system:cancel_job` via `Run()` (synchronously in-process). The cancel job is
+generic — it can cancel any target job — and its implementation is entirely
+internal to the job system.
 
 The cancel endpoint accepts a `broadcast` query parameter:
-- `broadcast=true` (default): the cancel job broadcasts a signal to all workers so the running handler can begin stopping immediately, then marks the job as cancelled in the DB and deletes its lease.
-- `broadcast=false`: skips the broadcast; if the job is not being executed locally, the cancel is applied to the DB state only and the method returns. Useful for cancelling pending (not yet running) jobs without incurring broadcast overhead.
+- `broadcast=true` (default): the cancel job broadcasts a signal to all workers
+  so the running handler can begin stopping immediately, then marks the job as
+  cancelled in the DB and deletes its lease.
+- `broadcast=false`: skips the broadcast; if the job is not being executed
+  locally, the cancel is applied to the DB state only and the method returns.
+  Useful for cancelling pending (not yet running) jobs without incurring
+  broadcast overhead.
 
 ```go
 // cancelJobRequest is the request payload for the internal cancel job.
@@ -854,7 +986,11 @@ func (s *System) registerSystemJobs() {
 }
 ```
 
-Each worker exposes an internal HTTP endpoint that receives cancel notifications from the broadcast. When a cancel notification is received, the worker looks up the job in its in-memory set of active jobs and cancels the associated context. A goroutine is dispatched to wait for the running handler goroutine to fully exit before the cancel is considered complete.
+Each worker exposes an internal HTTP endpoint that receives cancel
+notifications from the broadcast. When a cancel notification is received, the
+worker looks up the job in its in-memory set of active jobs and cancels the
+associated context. A goroutine is dispatched to wait for the running handler
+goroutine to fully exit before the cancel is considered complete.
 
 ```go
 // activeJob holds the cancel function and a WaitGroup for a running job goroutine.
@@ -884,13 +1020,15 @@ func (w *Worker) handleCancelNotify(rw http.ResponseWriter, r *http.Request) {
 }
 ```
 
-If the job completes before the cancellation arrives, the cancel is a no-op. If the handler respects context cancellation, it will stop work promptly.
+If the job completes before the cancellation arrives, the cancel is a no-op. If
+the handler respects context cancellation, it will stop work promptly.
 
 ---
 
 ## HTTP Management API
 
-The management API exposes job lifecycle operations. It is intended for internal use (operators, support tooling) rather than external consumers.
+The management API exposes job lifecycle operations. It is intended for
+internal use (operators, support tooling) rather than external consumers.
 
 | Method | Path | Description |
 |---|---|---|
@@ -901,7 +1039,8 @@ The management API exposes job lifecycle operations. It is intended for internal
 
 ### Cancel
 
-The cancel endpoint creates and runs a `__system:cancel_job` in-process, which handles broadcast (if requested), DB update, and lease deletion atomically.
+The cancel endpoint creates and runs a `__system:cancel_job` in-process, which
+handles broadcast (if requested), DB update, and lease deletion atomically.
 
 ```go
 func (api *API) Cancel(ctx context.Context, jobID uuid.UUID, broadcast bool) error {
@@ -913,18 +1052,34 @@ func (api *API) Cancel(ctx context.Context, jobID uuid.UUID, broadcast bool) err
 
 ### Retry
 
-Retry creates a special `__system:retry_job` via `Dispatch()`. This retry job is entirely internal to the job system and can retry any permanently-failed target job.
+Retry creates a special `__system:retry_job` via `Dispatch()`. This retry job
+is entirely internal to the job system and can retry any permanently-failed
+target job.
 
 #### Design
 
-The core problem is that the target job's `max_attempts` has already been exhausted — the normal claim-time validation (`nextAttemptNo > max_attempts`) would immediately mark the job failed again without executing. The retry job sidesteps this by **acting as the executor itself**: rather than re-enqueuing the target job for a worker to claim, the retry job's own handler directly inserts attempt rows for the target job and invokes its handler via `runOnce`, sharing the execution code path with normal job execution.
+The core problem is that the target job's `max_attempts` has already been
+exhausted — the normal claim-time validation (`nextAttemptNo > max_attempts`)
+would immediately mark the job failed again without executing. The retry job
+sidesteps this by **acting as the executor itself**: rather than re-enqueuing
+the target job for a worker to claim, the retry job's own handler directly
+inserts attempt rows for the target job and invokes its handler via `runOnce`,
+sharing the execution code path with normal job execution.
 
-The retry job has a very high `max_attempts` (equal to the original job's `max_attempts`) so it gets a full fresh set of attempts. Each attempt of the retry job corresponds to exactly one attempt of the target job:
+The retry job has a very high `max_attempts` (equal to the original job's
+`max_attempts`) so it gets a full fresh set of attempts. Each attempt of the
+retry job corresponds to exactly one attempt of the target job:
 
-- If the target handler **succeeds**, the retry job records success on the target attempt row and returns successfully — the retry job is done.
-- If the target handler **fails**, the retry job records failure on the target attempt row and returns an error — the retry job's own retry mechanism (its `runWithRetry` loop) handles backoff and re-execution.
+- If the target handler **succeeds**, the retry job records success on the
+  target attempt row and returns successfully — the retry job is done.
+- If the target handler **fails**, the retry job records failure on the target
+  attempt row and returns an error — the retry job's own retry mechanism (its
+  `runWithRetry` loop) handles backoff and re-execution.
 
-This means the normal `runWithRetry` code path is shared: the retry job's execution is itself subject to `runWithRetry`, so backoff, lease heartbeating, graceful termination, and failure recording all work identically for retried jobs as for original jobs.
+This means the normal `runWithRetry` code path is shared: the retry job's
+execution is itself subject to `runWithRetry`, so backoff, lease heartbeating,
+graceful termination, and failure recording all work identically for retried
+jobs as for original jobs.
 
 #### Logic outline
 
@@ -943,7 +1098,9 @@ __system:retry_job handler (one attempt = one target job handler invocation):
          attempt_no, and loops back to step 1 on the next retry job attempt.
 ```
 
-`runOnce` is a helper extracted from `runWithRetry` that executes the handler a single time and records the result — `runWithRetry` is then a loop over `runOnce`. Both regular jobs and the retry job share this path.
+`runOnce` is a helper extracted from `runWithRetry` that executes the handler a
+single time and records the result — `runWithRetry` is then a loop over
+`runOnce`. Both regular jobs and the retry job share this path.
 
 #### Code
 
@@ -1006,7 +1163,9 @@ s.Register("__system:retry_job", jobs.JobFn(func(ctx context.Context, req retryJ
 }))
 ```
 
-When the retry job is dispatched, it sets `max_attempts` on itself equal to the original job's `max_attempts`, giving the target job a full second set of attempts:
+When the retry job is dispatched, it sets `max_attempts` on itself equal to the
+original job's `max_attempts`, giving the target job a full second set of
+attempts:
 
 ```go
 func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
@@ -1027,7 +1186,9 @@ func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
 }
 ```
 
-Retried jobs can themselves be cancelled (via the cancel endpoint) and re-retried (by calling retry again). Re-retrying dispatches a new `__system:retry_job` with a fresh `max_attempts` budget.
+Retried jobs can themselves be cancelled (via the cancel endpoint) and
+re-retried (by calling retry again). Re-retrying dispatches a new
+`__system:retry_job` with a fresh `max_attempts` budget.
 
 ---
 
@@ -1035,7 +1196,11 @@ Retried jobs can themselves be cancelled (via the cancel endpoint) and re-retrie
 
 ### Structured Logging
 
-All worker and handler activity is logged using `slog`. Context is propagated through to handlers so that request-scoped values (trace IDs, user IDs) appear in logs. Always use the `Context` variants of slog methods (`InfoContext`, `ErrorContext`, `WarnContext`) so that context-attached values are included in log output.
+All worker and handler activity is logged using `slog`. Context is propagated
+through to handlers so that request-scoped values (trace IDs, user IDs) appear
+in logs. Always use the `Context` variants of slog methods (`InfoContext`,
+`ErrorContext`, `WarnContext`) so that context-attached values are included in
+log output.
 
 ```go
 func (w *Worker) execute(ctx context.Context, job *Job, attempt *Attempt) error {
@@ -1081,14 +1246,20 @@ func (w *Worker) execute(ctx context.Context, job *Job, attempt *Attempt) error 
 
 ## Graceful Termination
 
-When a worker process receives SIGTERM, it enters a 2-minute grace period to allow in-flight jobs to finish before the process exits.
+When a worker process receives SIGTERM, it enters a 2-minute grace period to
+allow in-flight jobs to finish before the process exits.
 
 ### Shutdown Sequence
 
-1. **Stop accepting new claims** — the poll loop exits immediately; no new leases are acquired.
-2. **Drain in-flight jobs** — wait up to 2 minutes for all running handlers to complete naturally.
-3. **Cancel remaining jobs** — if any jobs are still running after 2 minutes, cancel their contexts. Handlers that respect context cancellation will stop promptly.
-4. **Release leases** — for any jobs that did not finish, release their leases so another worker can re-claim them.
+1. **Stop accepting new claims** — the poll loop exits immediately; no new
+   leases are acquired.
+2. **Drain in-flight jobs** — wait up to 2 minutes for all running handlers to
+   complete naturally.
+3. **Cancel remaining jobs** — if any jobs are still running after 2 minutes,
+   cancel their contexts. Handlers that respect context cancellation will stop
+   promptly.
+4. **Release leases** — for any jobs that did not finish, release their leases
+   so another worker can re-claim them.
 5. **Exit** — the process exits cleanly.
 
 ```go
@@ -1147,17 +1318,28 @@ worker.Shutdown()
 
 ### Interaction with Local Retry
 
-Because the worker retains leases during transient failures and retries locally, graceful termination must account for jobs that are currently sleeping between retry attempts. These jobs are tracked in `w.activeJobs` alongside actively-executing jobs. Cancelling their context in step 3 wakes them from the backoff `select` in `runWithRetry`, which triggers an immediate `leases.Release` before the goroutine exits.
+Because the worker retains leases during transient failures and retries
+locally, graceful termination must account for jobs that are currently sleeping
+between retry attempts. These jobs are tracked in `w.activeJobs` alongside
+actively-executing jobs. Cancelling their context in step 3 wakes them from the
+backoff `select` in `runWithRetry`, which triggers an immediate
+`leases.Release` before the goroutine exits.
 
-This guarantees that no lease is left held by a stopped process — even jobs mid-backoff are cleanly returned to the pool for another worker to claim.
+This guarantees that no lease is left held by a stopped process — even jobs
+mid-backoff are cleanly returned to the pool for another worker to claim.
 
 ---
 
 ## Dependency Injection
 
-Handlers are registered as closures, capturing their dependencies (DB pool, HTTP clients, third-party SDKs) at startup. The job system has no knowledge of application-level dependencies — it only holds a map of `name → handler function`.
+Handlers are registered as closures, capturing their dependencies (DB pool,
+HTTP clients, third-party SDKs) at startup. The job system has no knowledge of
+application-level dependencies — it only holds a map of `name → handler
+function`.
 
-Wiring happens in a single location (e.g. `main.go` or a dedicated wiring file). This is the only site that knows about both the job system and application internals.
+Wiring happens in a single location (e.g. `main.go` or a dedicated wiring
+file). This is the only site that knows about both the job system and
+application internals.
 
 ```go
 // main.go or wiring.go
@@ -1184,7 +1366,9 @@ func wire(db *pgxpool.Pool, mailer *Mailer, billingClient *BillingClient) *jobs.
 }
 ```
 
-Each job file can export its own `Register()` function so job registration stays co-located with the job definition, without requiring all jobs to be wired in one central file:
+Each job file can export its own `Register()` function so job registration
+stays co-located with the job definition, without requiring all jobs to be
+wired in one central file:
 
 ```go
 // jobs/send_welcome_email.go
@@ -1200,7 +1384,8 @@ func Register(sys *jobs.System, mailer *Mailer) {
 }
 ```
 
-Adding a new job type only requires calling its `Register()` function at startup; the central wiring file does not need to be modified.
+Adding a new job type only requires calling its `Register()` function at
+startup; the central wiring file does not need to be modified.
 
 ---
 
@@ -1208,19 +1393,30 @@ Adding a new job type only requires calling its `Register()` function at startup
 
 ### Why cleanup matters
 
-The `jobs` and `job_attempts` tables grow without bound. Unbounded growth has real performance consequences:
+The `jobs` and `job_attempts` tables grow without bound. Unbounded growth has
+real performance consequences:
 
-- **Index bloat**: range scans over `(namespace, name, created_at)` slow down as the index covers millions of completed rows that will never be claimed again.
-- **Vacuum / GC overhead**: CockroachDB's MVCC garbage collection must process historical versions for every row ever updated or deleted. A large hot table increases GC pause time and storage amplification.
-- **Lease polling latency**: `AcquireMany` joins `leases` against `jobs` — if `jobs` is large and the index is cold, this query degrades.
+- **Index bloat**: range scans over `(namespace, name, created_at)` slow down
+  as the index covers millions of completed rows that will never be claimed
+  again.
+- **Vacuum / GC overhead**: CockroachDB's MVCC garbage collection must process
+  historical versions for every row ever updated or deleted. A large hot table
+  increases GC pause time and storage amplification.
+- **Lease polling latency**: `AcquireMany` joins `leases` against `jobs` — if
+  `jobs` is large and the index is cold, this query degrades.
 
 ### Why smart indexing alone is not enough
 
-Partial indexes (e.g. `WHERE finished_at IS NULL`) help claim-time queries but do not reduce table size. The table still grows unboundedly, compaction still has to scan all rows during GC, and backup/restore times grow linearly. Indexing is a complement to archival, not a substitute.
+Partial indexes (e.g. `WHERE finished_at IS NULL`) help claim-time queries but
+do not reduce table size. The table still grows unboundedly, compaction still
+has to scan all rows during GC, and backup/restore times grow linearly.
+Indexing is a complement to archival, not a substitute.
 
 ### Recommended approach: background archival to `job_history`
 
-Move terminal rows (`complete`, `failed`, `cancelled`) older than 30 days to a cold `job_history` table. The hot `jobs` table stays small; historical data remains queryable.
+Move terminal rows (`complete`, `failed`, `cancelled`) older than 30 days to a
+cold `job_history` table. The hot `jobs` table stays small; historical data
+remains queryable.
 
 ```sql
 -- Cold archive table (identical schema to jobs; kept on cheaper/slower storage if available).
@@ -1272,9 +1468,16 @@ s.Register("__system:archive_jobs", jobs.JobFn(func(ctx context.Context, req str
 }))
 ```
 
-> **Batch size**: for very large tables, archive in smaller batches (e.g. `LIMIT 1000` per transaction) to avoid holding locks. Run the archival job repeatedly until the backlog is cleared.
+> **Batch size**: for very large tables, archive in smaller batches (e.g.
+> `LIMIT 1000` per transaction) to avoid holding locks. Run the archival job
+> repeatedly until the backlog is cleared.
 
-> **CRDB Row-Level TTL**: CockroachDB 22.2+ supports [row-level TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl.html) natively (`ttl_expiration_expression`). This automatically deletes rows past a threshold without custom code, but does not support migrating rows to a cold table. Use TTL if you do not need to retain history; use the archival job if you do.
+> **CRDB Row-Level TTL**: CockroachDB 22.2+ supports [row-level
+> TTL](https://www.cockroachlabs.com/docs/stable/row-level-ttl.html) natively
+> (`ttl_expiration_expression`). This automatically deletes rows past a
+> threshold without custom code, but does not support migrating rows to a cold
+> table. Use TTL if you do not need to retain history; use the archival job if
+> you do.
 
 ---
 
@@ -1282,7 +1485,11 @@ s.Register("__system:archive_jobs", jobs.JobFn(func(ctx context.Context, req str
 
 ### Problem
 
-Multiple callers — API handlers, support tooling, monitoring dashboards — need to look up the current status of a job by ID. The `jobs_overview` view answers this correctly, but it involves a correlated subquery (`LATERAL JOIN` against `job_attempts`) that becomes expensive under concurrent load and large table sizes.
+Multiple callers — API handlers, support tooling, monitoring dashboards — need
+to look up the current status of a job by ID. The `jobs_overview` view answers
+this correctly, but it involves a correlated subquery (`LATERAL JOIN` against
+`job_attempts`) that becomes expensive under concurrent load and large table
+sizes.
 
 ### Why a separate status table is the right answer
 
@@ -1294,15 +1501,25 @@ The alternatives are:
 | Add `status` column to `jobs` | Simple to query | `jobs` is append-only by design; adding a mutable column breaks that invariant |
 | Dedicated `job_status` table | O(1) lookup; no joins; easy to index; decoupled from execution tables | Requires updates at lifecycle events; one more table to keep consistent |
 
-A dedicated `job_status` table is the cleanest option. It is updated within the same transaction as each lifecycle event, so it is always consistent with the execution tables. Reads are a simple primary-key lookup.
+A dedicated `job_status` table is the cleanest option. It is updated within the
+same transaction as each lifecycle event, so it is always consistent with the
+execution tables. Reads are a simple primary-key lookup.
 
 ### Should `job_status` store the response payload?
 
 **No. `job_status` does not store the response.**
 
-`job_status` is a high-load table: it is updated on every state transition and read by every status poll. Storing response payloads here would increase row size, amplify write cost, and put unnecessary pressure on the primary-key index. The table must stay lightweight — just enough to answer "is this job done?" without payload baggage.
+`job_status` is a high-load table: it is updated on every state transition and
+read by every status poll. Storing response payloads here would increase row
+size, amplify write cost, and put unnecessary pressure on the primary-key
+index. The table must stay lightweight — just enough to answer "is this job
+done?" without payload baggage.
 
-Response payloads remain in `job_attempts`. Callers that need the response read it from `job_attempts` directly after observing `status = 'complete'`. Callers that care only about job side effects (e.g. "did the email send?") check `job_status` and stop there — they never need to read `job_attempts` at all. This split lets each use-case pay only for what it actually needs.
+Response payloads remain in `job_attempts`. Callers that need the response read
+it from `job_attempts` directly after observing `status = 'complete'`. Callers
+that care only about job side effects (e.g. "did the email send?") check
+`job_status` and stop there — they never need to read `job_attempts` at all.
+This split lets each use-case pay only for what it actually needs.
 
 ```
 Caller pattern A — cares about side effects only:
@@ -1315,39 +1532,44 @@ Caller pattern B — cares about the response value:
       WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1
 ```
 
-`Run()` follows pattern B internally because it must return the response to the caller. `Dispatch()` follows pattern A — it waits for completion but does not surface the response.
+`Run()` follows pattern B internally because it must return the response to the
+caller. `Dispatch()` follows pattern A — it waits for completion but does not
+surface the response.
 
 ### Schema
 
 ```sql
 CREATE TABLE job_status (
-    job_id      UUID        PRIMARY KEY REFERENCES jobs(id),
-    status      TEXT        NOT NULL,       -- 'pending' | 'running' | 'complete' | 'failed' | 'cancelled' | 'pending_retry'
-    attempt_no  INT,                        -- most recent attempt number; NULL if never attempted
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    job_id      UUID         PRIMARY KEY REFERENCES jobs(id),
+    status      VARCHAR(10)  NOT NULL,       -- 'running' | 'failed' | 'completed'
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
     -- response is intentionally NOT stored here; read from job_attempts when needed
 );
 ```
 
 ### Lifecycle update points
 
-`job_status` is written once at creation and updated in the same transaction as every state transition:
+`job_status` exists only to answer one question: **is this job
+done?** It has three states: `running`, `completed`, `failed`. It is
+not written until a worker begins execution, and is updated only on
+terminal events. More granular state tracking (pending,
+pending_retry, cancelled) is available in the `jobs_overview` debug
+view, which derives state from `jobs` and `job_attempts`.
 
 | Event | Status written | Where |
 |---|---|---|
-| Job created (`Dispatch` / `Run`) | `pending` | Inside the INSERT tx |
 | Worker claims lease + inserts attempt | `running` | Inside `claimBatch` tx |
-| Job completes successfully | `complete` | Inside `complete()` tx |
-| Transient failure (retry remaining) | `pending_retry` | Inside `fail()` tx |
+| Job completes successfully | `completed` | Inside `complete()` tx |
+| Transient failure (retry remaining) | _(no change — stays `running`)_ | — |
 | Permanent failure (no retries) | `failed` | Inside `fail()` tx |
-| Job cancelled | `cancelled` | Inside `__system:cancel_job` tx |
-| Manual retry dispatched | `pending` | Inside `__system:retry_job` tx |
+| Job cancelled | `failed` | Inside `__system:cancel_job` tx |
+| Manual retry dispatched | `running` | Inside `__system:retry_job` tx |
 
 Example — updating status inside `complete()`:
 
 ```go
 func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
-    _, err := tx.ExecContext(ctx,
+    _, err := tx.Exec(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
         resp, attempt.JobID, attempt.AttemptNo,
@@ -1357,11 +1579,10 @@ func (w *Worker) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attem
     }
 
     // Update denormalized status in the same tx.
-    _, err = tx.ExecContext(ctx,
-        `INSERT INTO job_status (job_id, status, attempt_no, updated_at)
-         VALUES ($1, 'complete', $2, now())
-         ON CONFLICT (job_id) DO UPDATE SET status = 'complete', attempt_no = $2, updated_at = now()`,
-        attempt.JobID, attempt.AttemptNo,
+    _, err = tx.Exec(ctx,
+        `UPDATE job_status SET status = 'completed', updated_at = now()
+         WHERE job_id = $1`,
+        attempt.JobID,
     )
     if err != nil {
         return err
@@ -1389,4 +1610,123 @@ func (api *API) GetJobStatus(ctx context.Context, jobID uuid.UUID) (*JobStatus, 
 
 This is a single primary-key scan — effectively O(1) regardless of how many jobs exist.
 
-> **`jobs_overview` is still useful** for debugging and ad-hoc queries where you want attempt history alongside status. `job_status` is the fast path for programmatic lookups.
+> **`jobs_overview` is still useful** for debugging and ad-hoc queries where
+> you want attempt history alongside status. `job_status` is the fast path for
+> programmatic lookups.
+
+---
+
+## Optimizations
+
+### Batched Status Polling
+
+`pollForCompletion` and `pollForResult` each run an independent query per
+caller per tick. At 50-100 concurrent pollers (e.g. API handlers waiting on
+`Run()` or retried `Dispatch()` calls), this means 50-100 connections checked
+out of the pool every second for simple point reads. The DB handles the load
+fine, but the connection pool becomes the bottleneck — polling callers starve
+actual work (job inserts, lease operations, attempt writes) of connections.
+
+**Solution:** A single background goroutine batches all active poll
+subscriptions into one query per tick.
+
+```go
+// statusPoller batches concurrent poll requests into a single DB round-trip per tick.
+type statusPoller struct {
+    mu       sync.Mutex
+    subs     map[uuid.UUID][]chan statusResult // job_id → waiting callers
+    db       DBTX
+    interval time.Duration
+}
+
+type statusResult struct {
+    Status   string
+    Response json.RawMessage // only populated for pollForResult callers
+    Err      error
+}
+
+// Subscribe registers interest in a job's status. The returned channel receives
+// exactly one result when the job reaches a terminal state.
+func (sp *statusPoller) Subscribe(jobID uuid.UUID, wantResponse bool) <-chan statusResult {
+    ch := make(chan statusResult, 1)
+    sp.mu.Lock()
+    sp.subs[jobID] = append(sp.subs[jobID], ch)
+    sp.mu.Unlock()
+    return ch
+}
+
+// run is the background loop. One query per tick, regardless of subscriber count.
+func (sp *statusPoller) run(ctx context.Context) {
+    ticker := time.NewTicker(sp.interval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            sp.mu.Lock()
+            ids := make([]uuid.UUID, 0, len(sp.subs))
+            for id := range sp.subs {
+                ids = append(ids, id)
+            }
+            sp.mu.Unlock()
+
+            if len(ids) == 0 {
+                continue
+            }
+
+            rows, err := sp.db.Query(ctx,
+                `SELECT job_id, status FROM job_status WHERE job_id = ANY($1)`,
+                ids,
+            )
+            if err != nil {
+                continue // next tick will retry
+            }
+
+            for rows.Next() {
+                var jobID uuid.UUID
+                var status string
+                rows.Scan(&jobID, &status)
+
+                switch status {
+                case "complete", "failed", "cancelled":
+                    sp.mu.Lock()
+                    waiters := sp.subs[jobID]
+                    delete(sp.subs, jobID)
+                    sp.mu.Unlock()
+
+                    result := statusResult{Status: status}
+                    for _, ch := range waiters {
+                        ch <- result
+                        close(ch)
+                    }
+                }
+                // pending, running, pending_retry — keep polling
+            }
+            rows.Close()
+        }
+    }
+}
+```
+
+This reduces connection usage from O(N) to O(1) per tick. Callers block on a
+channel instead of holding a connection:
+
+```go
+func (p *Publisher) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
+    ch := p.poller.Subscribe(jobID, false)
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case result := <-ch:
+        if result.Err != nil {
+            return result.Err
+        }
+        if result.Status != "complete" {
+            return fmt.Errorf("job %s: %s", jobID, result.Status)
+        }
+        return nil
+    }
+}
+```
