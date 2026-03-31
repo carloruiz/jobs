@@ -96,6 +96,7 @@ CREATE TABLE jobs (
     metadata         JSONB,                              -- arbitrary caller-supplied key-value pairs; "system" key reserved for context propagation
     request          JSONB       NOT NULL,               -- input payload (max 1MB)
     max_attempts     INT         NOT NULL,
+    retry_until      TIMESTAMPTZ,                        -- optional; overrides max_attempts — keep retrying until this time elapses
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     creator_sha      TEXT        NOT NULL,               -- git SHA of the service that dispatched
     creator_host     TEXT        NOT NULL,               -- hostname of the service that dispatched
@@ -155,6 +156,7 @@ SELECT
     j.name,
     j.namespace,
     j.max_attempts,
+    j.retry_until,
     j.deadline,
     j.created_at,
     a.attempt_no,
@@ -168,7 +170,9 @@ SELECT
         WHEN a.attempt_no IS NULL                   THEN 'pending'
         WHEN a.finished_at IS NULL                  THEN 'running'
         WHEN a.error IS NOT NULL
-             AND a.attempt_no >= j.max_attempts     THEN 'failed'
+             AND a.attempt_no >= j.max_attempts
+             AND (j.retry_until IS NULL OR now() >= j.retry_until)
+                                                    THEN 'failed'
         WHEN a.error IS NOT NULL                    THEN 'pending_retry'
         ELSE                                             'complete'
     END            AS status
@@ -532,7 +536,7 @@ func (js *System) claimBatch(ctx context.Context) ([]*Attempt, error) {
 
     // Load job metadata and last attempt number for each claimed job.
     rows, err := tx.QueryContext(ctx, `
-        SELECT j.id, j.name, j.max_attempts, j.backoff_policy, j.deadline, j.request,
+        SELECT j.id, j.name, j.max_attempts, j.retry_until, j.backoff_policy, j.deadline, j.request,
                COALESCE(a.attempt_no, 0) AS last_attempt_no,
                a.started_at
         FROM jobs j
@@ -583,8 +587,11 @@ Before executing, each claimed job is validated:
 1. **Registered job type** — if `name` is not in the local
    registry, the job is released and skipped. This is safe when
    the number of job types is small (< ~30).
-2. **Max attempts** — if `nextAttemptNo > max_attempts`, the job is marked
-   permanently failed and the lease is deleted.
+2. **Max attempts** — if `nextAttemptNo > max_attempts` and
+   `retry_until` is nil or has elapsed, the job is marked permanently
+   failed and the lease is deleted. When `retry_until` is set and
+   still in the future, the job continues retrying beyond
+   `max_attempts`.
 3. **Deadline** — if `deadline` is non-nil and has passed, the job is marked
    failed with reason `"deadline exceeded"` and the lease is deleted.
 4. **Backoff** — if the elapsed time since the previous attempt's `started_at`
@@ -600,7 +607,9 @@ func (js *System) validate(job *Job, nextAttemptNo int) error {
         return fmt.Errorf("unknown job type %q", job.Name)
     }
     if nextAttemptNo > job.MaxAttempts {
-        return ErrMaxAttemptsExceeded
+        if job.RetryUntil == nil || time.Now().After(*job.RetryUntil) {
+            return ErrMaxAttemptsExceeded
+        }
     }
     if job.Deadline != nil && time.Now().After(*job.Deadline) {
         return ErrDeadlineExceeded
@@ -680,12 +689,19 @@ func (js *System) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt,
     }
 
     if attempt.AttemptNo >= job.MaxAttempts {
-        // Permanently failed — delete the lease so no worker ever re-claims it.
-        return js.leases.Delete(ctx, tx, job.ID.String())
+        retryUntilActive := job.RetryUntil != nil && time.Now().Before(*job.RetryUntil)
+        if !retryUntilActive {
+            // Permanently failed — delete the lease so no worker
+            // ever re-claims it.
+            return js.leases.Delete(ctx, tx, job.ID.String())
+        }
+        // retry_until still in the future — keep retrying beyond
+        // max_attempts.
     }
 
-    // Transient failure — lease is retained. runWithRetry will sleep the backoff
-    // duration, insert the next job_attempts row, and retry locally.
+    // Transient failure — lease is retained. runWithRetry will
+    // sleep the backoff duration, insert the next job_attempts
+    // row, and retry locally.
     return nil
 }
 ```
@@ -721,7 +737,8 @@ func (js *System) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *
         }
         tx.Commit()
 
-        if attempt.AttemptNo >= job.MaxAttempts {
+        retryUntilActive := job.RetryUntil != nil && time.Now().Before(*job.RetryUntil)
+        if attempt.AttemptNo >= job.MaxAttempts && !retryUntilActive {
             // Permanent failure — lease already deleted inside fail().
             return nil, execErr
         }
@@ -1088,17 +1105,21 @@ func (api *API) Retry(ctx context.Context, jobID uuid.UUID) error {
     var targetJob Job
     var lastAttemptNo int
     row := api.db.QueryRowContext(ctx,
-        `SELECT j.id, j.name, j.request, j.backoff_policy, j.deadline,
+        `SELECT j.id, j.name, j.request, j.backoff_policy,
+                j.deadline, j.retry_until,
                 COALESCE(MAX(a.attempt_no), 0)
          FROM jobs j
          LEFT JOIN job_attempts a ON a.job_id = j.id
          WHERE j.id = $1
-         GROUP BY j.id, j.name, j.request, j.backoff_policy, j.deadline`,
+         GROUP BY j.id, j.name, j.request,
+                  j.backoff_policy, j.deadline,
+                  j.retry_until`,
         jobID,
     )
     if err := row.Scan(
         &targetJob.ID, &targetJob.Name, &targetJob.Request,
-        &targetJob.BackoffPolicy, &targetJob.Deadline, &lastAttemptNo,
+        &targetJob.BackoffPolicy, &targetJob.Deadline,
+        &targetJob.RetryUntil, &lastAttemptNo,
     ); err != nil {
         return fmt.Errorf("load target job: %w", err)
     }
