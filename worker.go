@@ -62,26 +62,16 @@ func (r *Runtime) claimLoop(ctx context.Context) {
 	}
 }
 
-// claimBatch acquires up to batchSize available leases for this namespace,
-// validates each corresponding job, and inserts a new attempt row for each
-// valid job. Lease acquisition and attempt insertion are atomic within a
-// single transaction.
-//
-// Jobs that fail validation are handled inline (lease released or permanently
-// failed) and are not returned to the caller.
-func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
+// acquireAndLoad acquires up to batchSize available leases for this namespace
+// and loads the corresponding job rows. Returns the job candidates and a map
+// of job ID to lease token.
+func (r *Runtime) acquireAndLoad(ctx context.Context, tx pgx.Tx) ([]scannedJobRow, map[uuid.UUID]leases.LeaseToken, error) {
 	acquiredLeases, err := r.leases.AcquireMany(ctx, tx, r.namespace, r.batchSize, hostname, leaseDuration)
 	if err != nil {
-		return nil, fmt.Errorf("acquire leases: %w", err)
+		return nil, nil, fmt.Errorf("acquire leases: %w", err)
 	}
 	if len(acquiredLeases) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	jobIDs := make([]uuid.UUID, 0, len(acquiredLeases))
@@ -109,36 +99,64 @@ func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
 		jobIDs,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("load jobs: %w", err)
+		return nil, nil, fmt.Errorf("load jobs: %w", err)
 	}
 
-	var scanned []scannedJobRow
+	var jobCandidates []scannedJobRow
 	for rows.Next() {
 		sr, scanErr := scanJobRow(rows)
 		if scanErr != nil {
 			rows.Close()
-			return nil, scanErr
+			return nil, nil, scanErr
 		}
-		scanned = append(scanned, sr)
+		jobCandidates = append(jobCandidates, sr)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows: %w", err)
+		return nil, nil, fmt.Errorf("rows: %w", err)
+	}
+
+	return jobCandidates, tokenByID, nil
+}
+
+// claimBatch acquires up to batchSize available leases for this namespace,
+// validates each corresponding job, and inserts a new attempt row for each
+// valid job. Lease acquisition and attempt insertion are atomic within a
+// single transaction.
+//
+// Jobs that fail validation are handled inline (lease released or permanently
+// failed) and are not returned to the caller.
+func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	jobCandidates, tokenByID, err := r.acquireAndLoad(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if len(jobCandidates) == 0 {
+		return nil, nil
 	}
 
 	var claimed []claimedJob
-	for _, sr := range scanned {
+	for _, sr := range jobCandidates {
 		job := sr.job
 		nextAttemptNo := sr.lastAttemptNo + 1
 		token := tokenByID[job.ID]
 
 		if valErr := r.validate(&job, nextAttemptNo, sr.lastStartedAt); valErr != nil {
-			r.handleValidationError(ctx, tx, &job, sr.lastAttemptNo, token, valErr)
+			if handleErr := r.handleValidationError(ctx, tx, &job, sr.lastAttemptNo, token, valErr); handleErr != nil {
+				// TODO(PR 7): replace with structured logging
+				fmt.Printf("handleValidationError for job %s: %v\n", job.ID, handleErr)
+			}
 			continue
 		}
 
 		// TODO(future): batch these inserts into a single round-trip.
-		if err := insertAttemptRow(ctx, tx, job.ID, nextAttemptNo, hostname, r.buildSHA); err != nil {
+		if err := insertJobAttemptRow(ctx, tx, insertAttemptParams{JobID: job.ID, AttemptNo: nextAttemptNo, Host: hostname, SHA: r.buildSHA}); err != nil {
 			return nil, fmt.Errorf("insert attempt for job %s: %w", job.ID, err)
 		}
 
@@ -191,23 +209,31 @@ func (r *Runtime) validate(job *Job, nextAttemptNo int, lastStartedAt *time.Time
 
 // handleValidationError handles a failed validate() result inside claimBatch's
 // transaction. Releases or permanently fails the job depending on the error type.
+// Returns an error if any DB operation fails; the caller is responsible for logging.
 func (r *Runtime) handleValidationError(
 	ctx context.Context, tx pgx.Tx, job *Job, lastAttemptNo int, token leases.LeaseToken, err error,
-) {
+) error {
 	switch {
 	case errors.Is(err, ErrBackoffNotElapsed):
 		// Transient skip: release the lease so another worker can re-claim later.
-		_ = r.leases.Release(ctx, tx, job.ID.String(), token)
+		return r.leases.Release(ctx, tx, job.ID.String(), token)
 
 	case errors.Is(err, ErrMaxAttemptsExceeded), errors.Is(err, ErrDeadlineExceeded):
 		// Permanent failure: append a terminal attempt row recording the error,
 		// then delete the lease. The attempts table is append-only; never update.
-		// TODO(PR 7): log structured error here.
-		_ = insertFailedAttemptRow(ctx, tx, job.ID, lastAttemptNo+1, hostname, r.buildSHA, err.Error())
-		_ = r.leases.Delete(ctx, tx, job.ID.String())
+		if insertErr := insertFailedAttemptRow(ctx, tx, insertFailedAttemptParams{
+			JobID:     job.ID,
+			AttemptNo: lastAttemptNo + 1,
+			Host:      hostname,
+			SHA:       r.buildSHA,
+			ErrMsg:    err.Error(),
+		}); insertErr != nil {
+			return insertErr
+		}
+		return r.leases.Delete(ctx, tx, job.ID.String())
 
 	default:
 		// Unknown job type or unexpected error: release and skip.
-		_ = r.leases.Release(ctx, tx, job.ID.String(), token)
+		return r.leases.Release(ctx, tx, job.ID.String(), token)
 	}
 }

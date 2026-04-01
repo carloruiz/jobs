@@ -38,41 +38,67 @@ func scanJobRow(rows pgx.Rows) (scannedJobRow, error) {
 	return sr, nil
 }
 
-// insertAttemptRow inserts a new row into job_attempts.
-func insertAttemptRow(ctx context.Context, q DB, jobID uuid.UUID, attemptNo int, host, sha string) error {
+// insertAttemptParams holds named fields for inserting a job attempt row.
+type insertAttemptParams struct {
+	JobID     uuid.UUID
+	AttemptNo int
+	Host      string
+	SHA       string
+}
+
+// insertFailedAttemptParams holds named fields for inserting a terminal (failed) attempt row.
+type insertFailedAttemptParams struct {
+	JobID     uuid.UUID
+	AttemptNo int
+	Host      string
+	SHA       string
+	ErrMsg    string
+}
+
+// insertJobParams holds named fields for inserting a new job row.
+type insertJobParams struct {
+	ID          uuid.UUID
+	Key         string
+	Name        string
+	Namespace   string
+	BuildSHA    string
+	CreatorHost string
+	Request     json.RawMessage
+	MaxAttempts int
+	BackoffJSON []byte
+}
+
+// insertJobAttemptRow inserts a new row into job_attempts.
+func insertJobAttemptRow(ctx context.Context, q DB, p insertAttemptParams) error {
 	_, err := q.Exec(ctx,
 		`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha) VALUES ($1, $2, $3, $4)`,
-		jobID, attemptNo, host, sha,
+		p.JobID, p.AttemptNo, p.Host, p.SHA,
 	)
 	return err
 }
 
 // insertFailedAttemptRow inserts a terminal row into job_attempts with the
 // error field set and finished_at stamped to now.
-func insertFailedAttemptRow(ctx context.Context, q DB, jobID uuid.UUID, attemptNo int, host, sha string, errMsg string) error {
-	errJSON, _ := json.Marshal(map[string]string{"message": errMsg})
+func insertFailedAttemptRow(ctx context.Context, q DB, p insertFailedAttemptParams) error {
+	errJSON, _ := json.Marshal(map[string]string{"message": p.ErrMsg})
 	_, err := q.Exec(ctx,
 		`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha, error, finished_at) VALUES ($1, $2, $3, $4, $5, now())`,
-		jobID, attemptNo, host, sha, errJSON,
+		p.JobID, p.AttemptNo, p.Host, p.SHA, errJSON,
 	)
 	return err
 }
 
-// upsertJobRow inserts a new job row. Returns the inserted Job and false on
+// tryInsertJobRow inserts a new job row. Returns the inserted Job and false on
 // success. Returns an empty Job and true (conflict=true) when a row with the
 // same (name, idempotency_key) already exists.
-func upsertJobRow(
-	ctx context.Context, tx pgx.Tx,
-	id uuid.UUID, key, name, namespace, buildSHA, creatorHost string,
-	raw json.RawMessage, maxAttempts int, backoffJSON []byte,
-) (Job, bool, error) {
+func tryInsertJobRow(ctx context.Context, tx pgx.Tx, p insertJobParams) (Job, bool, error) {
 	var job Job
 	err := tx.QueryRow(ctx, `
 		INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request, max_attempts, backoff_policy)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (name, idempotency_key) DO NOTHING
 		RETURNING id, idempotency_key, name, namespace`,
-		id, key, name, namespace, buildSHA, creatorHost, raw, maxAttempts, backoffJSON,
+		p.ID, p.Key, p.Name, p.Namespace, p.BuildSHA, p.CreatorHost, p.Request, p.MaxAttempts, p.BackoffJSON,
 	).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, true, nil

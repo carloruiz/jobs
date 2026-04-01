@@ -141,7 +141,17 @@ func (r *Runtime) Dispatch(
 	}
 	defer tx.Rollback(ctx)
 
-	job, conflict, err := upsertJobRow(ctx, tx, uuid.New(), key, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON)
+	job, conflict, err := tryInsertJobRow(ctx, tx, insertJobParams{
+		ID:          uuid.New(),
+		Key:         key,
+		Name:        name,
+		Namespace:   r.namespace,
+		BuildSHA:    r.buildSHA,
+		CreatorHost: hostname,
+		Request:     raw,
+		MaxAttempts: jreg.config.MaxAttempts,
+		BackoffJSON: backoffJSON,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("insert job: %w", err)
 	}
@@ -162,7 +172,7 @@ func (r *Runtime) Dispatch(
 		return nil, fmt.Errorf("create and acquire lease: %w", err)
 	}
 
-	if err := insertAttemptRow(ctx, tx, job.ID, 1, hostname, r.buildSHA); err != nil {
+	if err := insertJobAttemptRow(ctx, tx, insertAttemptParams{JobID: job.ID, AttemptNo: 1, Host: hostname, SHA: r.buildSHA}); err != nil {
 		return nil, fmt.Errorf("insert attempt: %w", err)
 	}
 
@@ -221,7 +231,17 @@ func (r *Runtime) Run(
 	}
 	defer tx.Rollback(ctx)
 
-	job, conflict, err := upsertJobRow(ctx, tx, uuid.New(), idempotencyKey, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON)
+	job, conflict, err := tryInsertJobRow(ctx, tx, insertJobParams{
+		ID:          uuid.New(),
+		Key:         idempotencyKey,
+		Name:        name,
+		Namespace:   r.namespace,
+		BuildSHA:    r.buildSHA,
+		CreatorHost: hostname,
+		Request:     raw,
+		MaxAttempts: jreg.config.MaxAttempts,
+		BackoffJSON: backoffJSON,
+	})
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -246,7 +266,7 @@ func (r *Runtime) Run(
 		return fmt.Errorf("create and acquire lease: %w", err)
 	}
 
-	if err := insertAttemptRow(ctx, tx, job.ID, 1, hostname, r.buildSHA); err != nil {
+	if err := insertJobAttemptRow(ctx, tx, insertAttemptParams{JobID: job.ID, AttemptNo: 1, Host: hostname, SHA: r.buildSHA}); err != nil {
 		return fmt.Errorf("insert attempt: %w", err)
 	}
 
@@ -355,7 +375,7 @@ func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *At
 		}
 
 		nextNo := attempt.AttemptNo + 1
-		if err := insertAttemptRow(ctx, db, job.ID, nextNo, hostname, r.buildSHA); err != nil {
+		if err := insertJobAttemptRow(ctx, db, insertAttemptParams{JobID: job.ID, AttemptNo: nextNo, Host: hostname, SHA: r.buildSHA}); err != nil {
 			return nil, fmt.Errorf("insert next attempt: %w", err)
 		}
 
