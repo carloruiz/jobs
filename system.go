@@ -32,12 +32,6 @@ func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
 	}
 }
 
-// Lookup returns the Handler registered for the given job name.
-func (r *Runtime) Lookup(name string) (Handler, bool) {
-	h, ok := r.registry[name]
-	return h, ok
-}
-
 // Register registers a typed handler for the given job name. Go infers the
 // type parameters from fn, so callers never write explicit type annotations:
 //
