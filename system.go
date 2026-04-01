@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime/debug"
 	"time"
 
 	"github.com/carloruiz/leases"
@@ -16,27 +15,20 @@ import (
 
 const leaseDuration = 30 * time.Second
 
-var (
-	hostname = initHostname()
-	buildSHA = initBuildSHA()
-)
+var hostname = initHostname()
 
 func initHostname() string {
 	h, _ := os.Hostname()
 	return h
 }
 
-func initBuildSHA() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "unknown"
-	}
-	for _, s := range info.Settings {
-		if s.Key == "vcs.revision" {
-			return s.Value
-		}
-	}
-	return "unknown"
+// JobConfig holds per-job-type configuration set at registration time.
+type JobConfig struct {
+	// MaxAttempts is the maximum number of attempts for this job type.
+	// Defaults to 3 if zero.
+	MaxAttempts int
+	// BackoffPolicy defines the retry delay schedule for this job type.
+	BackoffPolicy BackoffPolicy
 }
 
 // Config holds startup configuration for a Runtime.
@@ -47,11 +39,15 @@ type Config struct {
 	// Defaults to 2s if zero.
 	// TODO(PR 6): replaced by statusPoller which batches all active subscriptions.
 	PollInterval time.Duration
-	// DefaultMaxAttempts is used when no per-job attempt limit is specified.
-	// Defaults to 3 if zero.
-	DefaultMaxAttempts int
-	// DefaultBackoffPolicy is used when no per-job policy is specified.
-	DefaultBackoffPolicy BackoffPolicy
+	// BuildSHA is the git SHA of the binary used for tracing/attribution.
+	// Set by the caller; leave empty if not needed.
+	BuildSHA string
+}
+
+// registeredJob bundles a handler with its per-job-type configuration.
+type registeredJob struct {
+	handler Handler
+	config  JobConfig
 }
 
 // Runtime is the top-level struct that handles both dispatching and executing
@@ -61,42 +57,40 @@ type Config struct {
 // TODO(PR 4): add activeJobs map for heartbeat tracking.
 // TODO(PR 6): add statusPoller for batched completion polling.
 type Runtime struct {
-	namespace            string
-	db                   DB
-	leases               leases.Store
-	registry             map[string]Handler
-	defaultMaxAttempts   int
-	defaultBackoffPolicy BackoffPolicy
-	pollInterval         time.Duration
+	namespace    string
+	db           DB
+	leases       leases.Store
+	registry     map[string]registeredJob
+	buildSHA     string
+	pollInterval time.Duration
 }
 
 // NewRuntime constructs a Runtime with the given database, lease store, and config.
 func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
-	maxAttempts := cfg.DefaultMaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 3
-	}
 	pollInterval := cfg.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
 	return &Runtime{
-		namespace:            cfg.Namespace,
-		db:                   db,
-		leases:               ls,
-		registry:             make(map[string]Handler),
-		defaultMaxAttempts:   maxAttempts,
-		defaultBackoffPolicy: cfg.DefaultBackoffPolicy,
-		pollInterval:         pollInterval,
+		namespace:    cfg.Namespace,
+		db:           db,
+		leases:       ls,
+		registry:     make(map[string]registeredJob),
+		buildSHA:     cfg.BuildSHA,
+		pollInterval: pollInterval,
 	}
 }
 
-// Register registers a typed handler for the given job name. Go infers the
-// type parameters from fn, so callers never write explicit type annotations:
+// Register registers a typed handler for the given job name with per-job
+// configuration. Go infers the type parameters from fn, so callers never
+// write explicit type annotations:
 //
-//	jobs.Register(rt, "send_email", sendEmailHandler)
-func Register[Req, Resp any](r *Runtime, name string, fn func(ctx context.Context, req Req) (Resp, error)) {
-	r.registry[name] = JobFn[Req, Resp](fn)
+//	jobs.Register(rt, "send_email", jobs.JobConfig{MaxAttempts: 5}, sendEmailHandler)
+func Register[Req, Resp any](r *Runtime, name string, cfg JobConfig, fn func(ctx context.Context, req Req) (Resp, error)) {
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = 3
+	}
+	r.registry[name] = registeredJob{handler: JobFn[Req, Resp](fn), config: cfg}
 }
 
 // Dispatch creates the job row and prefers to run the handler locally in a
@@ -111,6 +105,11 @@ func Register[Req, Resp any](r *Runtime, name string, fn func(ctx context.Contex
 func (r *Runtime) Dispatch(
 	ctx context.Context, db DB, name string, req any, idempotencyKey string,
 ) (*Job, error) {
+	jreg, ok := r.registry[name]
+	if !ok {
+		return nil, fmt.Errorf("job %q is not registered", name)
+	}
+
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -121,7 +120,7 @@ func (r *Runtime) Dispatch(
 		key = uuid.NewString()
 	}
 
-	backoffJSON, err := json.Marshal(r.defaultBackoffPolicy)
+	backoffJSON, err := json.Marshal(jreg.config.BackoffPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("marshal backoff policy: %w", err)
 	}
@@ -138,7 +137,7 @@ func (r *Runtime) Dispatch(
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (name, idempotency_key) DO NOTHING
 		RETURNING id, idempotency_key, name, namespace`,
-		uuid.New(), key, name, r.namespace, buildSHA, hostname, raw, r.defaultMaxAttempts, backoffJSON,
+		uuid.New(), key, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON,
 	).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -168,7 +167,7 @@ func (r *Runtime) Dispatch(
 	if _, err = tx.Exec(ctx,
 		`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
 		 VALUES ($1, 1, $2, $3)`,
-		job.ID, hostname, buildSHA,
+		job.ID, hostname, r.buildSHA,
 	); err != nil {
 		return nil, fmt.Errorf("insert attempt: %w", err)
 	}
@@ -178,8 +177,8 @@ func (r *Runtime) Dispatch(
 	}
 
 	job.Request = raw
-	job.BackoffPolicy = r.defaultBackoffPolicy
-	job.MaxAttempts = r.defaultMaxAttempts
+	job.BackoffPolicy = jreg.config.BackoffPolicy
+	job.MaxAttempts = jreg.config.MaxAttempts
 
 	attempt := &Attempt{
 		JobID:      job.ID,
@@ -187,7 +186,7 @@ func (r *Runtime) Dispatch(
 		Request:    raw,
 		LeaseToken: lease.Token,
 	}
-	go r.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
+	go r.keepRetrying(context.WithoutCancel(ctx), db, &job, attempt)
 	return &job, nil
 }
 
@@ -207,12 +206,17 @@ func (r *Runtime) Run(
 		return fmt.Errorf("Run: idempotencyKey is required")
 	}
 
+	jreg, ok := r.registry[name]
+	if !ok {
+		return fmt.Errorf("job %q is not registered", name)
+	}
+
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	backoffJSON, err := json.Marshal(r.defaultBackoffPolicy)
+	backoffJSON, err := json.Marshal(jreg.config.BackoffPolicy)
 	if err != nil {
 		return fmt.Errorf("marshal backoff policy: %w", err)
 	}
@@ -229,7 +233,7 @@ func (r *Runtime) Run(
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (name, idempotency_key) DO NOTHING
 		RETURNING id, idempotency_key, name, namespace`,
-		uuid.New(), idempotencyKey, name, r.namespace, buildSHA, hostname, raw, r.defaultMaxAttempts, backoffJSON,
+		uuid.New(), idempotencyKey, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON,
 	).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
 
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -263,7 +267,7 @@ func (r *Runtime) Run(
 	if _, err = tx.Exec(ctx,
 		`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
 		 VALUES ($1, 1, $2, $3)`,
-		job.ID, hostname, buildSHA,
+		job.ID, hostname, r.buildSHA,
 	); err != nil {
 		return fmt.Errorf("insert attempt: %w", err)
 	}
@@ -273,8 +277,8 @@ func (r *Runtime) Run(
 	}
 
 	job.Request = raw
-	job.BackoffPolicy = r.defaultBackoffPolicy
-	job.MaxAttempts = r.defaultMaxAttempts
+	job.BackoffPolicy = jreg.config.BackoffPolicy
+	job.MaxAttempts = jreg.config.MaxAttempts
 
 	attempt := &Attempt{
 		JobID:      job.ID,
@@ -283,7 +287,7 @@ func (r *Runtime) Run(
 		LeaseToken: lease.Token,
 	}
 
-	resultRaw, err := r.runWithRetry(ctx, db, &job, attempt)
+	resultRaw, err := r.keepRetrying(ctx, db, &job, attempt)
 	if err != nil {
 		return err
 	}
@@ -322,84 +326,43 @@ func (r *Runtime) pollForCompletion(ctx context.Context, jobID uuid.UUID) error 
 	}
 }
 
-// pollForResult polls jobs_overview until the job is complete, then fetches
-// and returns the response payload from job_attempts.
+// pollForResult polls for completion then fetches the response payload.
 // Used by Run() when a duplicate idempotency key is detected.
 // TODO(PR 5/6): replace with job_status table + statusPoller.
 func (r *Runtime) pollForResult(ctx context.Context, jobID uuid.UUID) (json.RawMessage, error) {
-	ticker := time.NewTicker(r.pollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-			var status string
-			err := r.db.QueryRow(ctx,
-				`SELECT status FROM jobs_overview WHERE job_id = $1`, jobID,
-			).Scan(&status)
-			if errors.Is(err, pgx.ErrNoRows) {
-				continue // job not yet visible
-			}
-			if err != nil {
-				return nil, fmt.Errorf("poll status: %w", err)
-			}
-			switch status {
-			case "complete":
-				var resp json.RawMessage
-				err = r.db.QueryRow(ctx,
-					`SELECT response FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1`,
-					jobID,
-				).Scan(&resp)
-				return resp, err
-			case "failed":
-				return nil, fmt.Errorf("job %s permanently failed", jobID)
-			}
-			// pending, running, pending_retry — keep polling
-		}
+	if err := r.pollForCompletion(ctx, jobID); err != nil {
+		return nil, err
 	}
+	var resp json.RawMessage
+	err := r.db.QueryRow(ctx,
+		`SELECT response FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1`,
+		jobID,
+	).Scan(&resp)
+	return resp, err
 }
 
-// runWithRetry executes the handler, retrying locally on transient failure.
+// keepRetrying executes the handler, retrying locally on transient failure.
 // The lease is held for the full retry loop: deleted on success or permanent
 // failure, released on context cancellation (graceful termination).
 //
 // TODO(PR 3): register/deregister in activeJobs for heartbeat tracking.
 // TODO(PR 8): integrate with graceful shutdown WaitGroup.
-func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *Attempt) (json.RawMessage, error) {
+func (r *Runtime) keepRetrying(ctx context.Context, db DB, job *Job, attempt *Attempt) (json.RawMessage, error) {
 	for {
-		resp, execErr := r.registry[job.Name].Handle(ctx, attempt.Request)
+		resp, execErr := r.registry[job.Name].handler.Handle(ctx, attempt.Request)
 		if execErr == nil {
-			tx, err := db.Begin(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("begin complete tx: %w", err)
-			}
-			if err := r.complete(ctx, tx, job, attempt, resp); err != nil {
-				tx.Rollback(ctx)
+			if err := r.complete(ctx, db, job, attempt, resp); err != nil {
 				return nil, fmt.Errorf("complete: %w", err)
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return nil, fmt.Errorf("commit complete: %w", err)
 			}
 			return resp, nil
 		}
 
-		// Record the failure atomically.
-		tx, err := db.Begin(ctx)
+		// Record the failure atomically; permanent indicates no retries remain.
+		permanent, err := r.fail(ctx, db, job, attempt, execErr)
 		if err != nil {
-			return nil, fmt.Errorf("begin fail tx: %w", err)
-		}
-		if err := r.fail(ctx, tx, job, attempt, execErr); err != nil {
-			tx.Rollback(ctx)
 			return nil, fmt.Errorf("record failure: %w", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit fail: %w", err)
-		}
-
-		retryUntilActive := job.RetryUntil != nil && time.Now().Before(*job.RetryUntil)
-		if attempt.AttemptNo >= job.MaxAttempts && !retryUntilActive {
-			// Permanent failure — lease already deleted inside fail().
+		if permanent {
 			return nil, execErr
 		}
 
@@ -416,7 +379,7 @@ func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *At
 		nextNo := attempt.AttemptNo + 1
 		if _, err := db.Exec(ctx,
 			`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha) VALUES ($1, $2, $3, $4)`,
-			job.ID, nextNo, hostname, buildSHA,
+			job.ID, nextNo, hostname, r.buildSHA,
 		); err != nil {
 			return nil, fmt.Errorf("insert next attempt: %w", err)
 		}
@@ -430,9 +393,13 @@ func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *At
 	}
 }
 
-// complete writes the response and deletes the lease atomically within tx.
-// Must be called inside a transaction; the caller commits or rolls back.
-func (r *Runtime) complete(ctx context.Context, tx pgx.Tx, job *Job, attempt *Attempt, resp json.RawMessage) error {
+// complete writes the response and deletes the lease atomically.
+func (r *Runtime) complete(ctx context.Context, db DB, job *Job, attempt *Attempt, resp json.RawMessage) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx,
 		`UPDATE job_attempts SET response = $1, finished_at = now()
 		 WHERE job_id = $2 AND attempt_no = $3`,
@@ -440,34 +407,54 @@ func (r *Runtime) complete(ctx context.Context, tx pgx.Tx, job *Job, attempt *At
 	); err != nil {
 		return err
 	}
-	return r.leases.Delete(ctx, tx, job.ID.String())
-}
-
-// fail records the error on the current attempt. On permanent failure (no
-// retries remaining), the lease is deleted. On transient failure, the lease is
-// retained; runWithRetry sleeps the backoff and retries locally.
-func (r *Runtime) fail(ctx context.Context, tx pgx.Tx, job *Job, attempt *Attempt, execErr error) error {
-	errJSON, err := json.Marshal(map[string]string{"message": execErr.Error()})
-	if err != nil {
+	if err := r.leases.Delete(ctx, tx, job.ID.String()); err != nil {
 		return err
 	}
+	return tx.Commit(ctx)
+}
+
+// fail records the error on the current attempt and returns (permanent, err).
+// permanent is true when no retries remain. On permanent failure, the lease is
+// deleted inside the transaction. On transient failure, the lease is retained;
+// keepRetrying sleeps the backoff and retries locally.
+func (r *Runtime) fail(ctx context.Context, db DB, job *Job, attempt *Attempt, execErr error) (bool, error) {
+	keepRetrying := attempt.AttemptNo < job.MaxAttempts ||
+		(job.RetryUntil != nil && time.Now().Before(*job.RetryUntil))
+
+	errJSON, err := json.Marshal(map[string]string{"message": execErr.Error()})
+	if err != nil {
+		return false, err
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	if _, err := tx.Exec(ctx,
 		`UPDATE job_attempts SET error = $1, finished_at = now()
 		 WHERE job_id = $2 AND attempt_no = $3`,
 		errJSON, attempt.JobID, attempt.AttemptNo,
 	); err != nil {
-		return err
+		return false, err
 	}
-	retryUntilActive := job.RetryUntil != nil && time.Now().Before(*job.RetryUntil)
-	if attempt.AttemptNo >= job.MaxAttempts && !retryUntilActive {
+
+	if !keepRetrying {
 		// Permanent failure — delete the lease so no worker ever re-claims it.
-		return r.leases.Delete(ctx, tx, job.ID.String())
+		if err := r.leases.Delete(ctx, tx, job.ID.String()); err != nil {
+			return false, err
+		}
 	}
-	return nil
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return !keepRetrying, nil
 }
 
-// backoffFor returns the delay to wait before retrying attempt number attemptNo
-// (1-based). The delay is clamped to the job's BackoffPolicy.
+// backoffFor returns the delay before retrying attempt number attemptNo (1-based).
+// The delay is capped by BackoffPolicy.MaxInterval when non-zero.
 func (r *Runtime) backoffFor(job *Job, attemptNo int) time.Duration {
 	return job.BackoffPolicy.Duration(attemptNo - 1)
 }

@@ -27,7 +27,7 @@ func TestRegister_RoundTrip(t *testing.T) {
 	fn := func(ctx context.Context, req addRequest) (addResponse, error) {
 		return addResponse{Sum: req.A + req.B}, nil
 	}
-	jobs.Register(rt, "add", fn)
+	jobs.Register(rt, "add", jobs.JobConfig{}, fn)
 	h := jobs.JobFn[addRequest, addResponse](fn)
 
 	raw, err := json.Marshal(addRequest{A: 3, B: 4})
@@ -55,7 +55,7 @@ func TestRegister_BadJSON(t *testing.T) {
 		t.Fatal("handler should not be called with invalid JSON")
 		return addResponse{}, nil
 	}
-	jobs.Register(rt, "add", fn)
+	jobs.Register(rt, "add", jobs.JobConfig{}, fn)
 	h := jobs.JobFn[addRequest, addResponse](fn)
 
 	_, err := h.Handle(context.Background(), json.RawMessage(`not valid json`))
@@ -70,7 +70,7 @@ func TestRegister_HandlerError(t *testing.T) {
 	fn := func(ctx context.Context, req addRequest) (addResponse, error) {
 		return addResponse{}, want
 	}
-	jobs.Register(rt, "add", fn)
+	jobs.Register(rt, "add", jobs.JobConfig{}, fn)
 	h := jobs.JobFn[addRequest, addResponse](fn)
 
 	raw, _ := json.Marshal(addRequest{A: 1, B: 2})
@@ -88,7 +88,7 @@ func TestRegister_EmptyRequest(t *testing.T) {
 	fn := func(ctx context.Context, req emptyReq) (emptyResp, error) {
 		return emptyResp{OK: true}, nil
 	}
-	jobs.Register(rt, "noop", fn)
+	jobs.Register(rt, "noop", jobs.JobConfig{}, fn)
 	h := jobs.JobFn[emptyReq, emptyResp](fn)
 
 	got, err := h.Handle(context.Background(), json.RawMessage(`{}`))

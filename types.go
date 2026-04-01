@@ -59,9 +59,10 @@ type BackoffPolicy struct {
 }
 
 // Duration returns the delay that should elapse before attempt n (0-based).
+// The result is capped to MaxInterval when MaxInterval is non-zero.
 func (b BackoffPolicy) Duration(attempt int) time.Duration {
 	d := float64(b.InitialInterval) * math.Pow(b.Multiplier, float64(attempt))
-	if time.Duration(d) >= b.MaxInterval {
+	if b.MaxInterval > 0 && time.Duration(d) >= b.MaxInterval {
 		return b.MaxInterval
 	}
 	return time.Duration(d)
