@@ -206,7 +206,7 @@ This view is used for debugging, not for claim logic.
 
 ### Dispatching a Job
 
-`System` is the top-level struct that handles both dispatching and
+`Runtime` is the top-level struct that handles both dispatching and
 executing jobs. `Dispatch()` creates the job row and, if no conflict
 is found, **prefers local execution**: it immediately acquires the
 lease and runs the handler in a goroutine, rather than creating an
@@ -222,11 +222,11 @@ dispatcher and executor. Falling back to an unlocked lease (async
 claim) only occurs when local execution cannot proceed — for
 example, when a race prevents immediate lease acquisition.
 
-Namespace is a system-wide configuration (set on `System` at
+Namespace is a system-wide configuration (set on `Runtime` at
 startup) and is not a per-call parameter.
 
 ```go
-type System struct {
+type Runtime struct {
     namespace string
     db        DBTX
     leases    leases.Store
@@ -262,14 +262,14 @@ call (e.g. due to a network timeout after the INSERT succeeded).
 // type parameters from fn, so callers never write explicit type annotations:
 //
 //     jobs.Register(sys, "send_email", sendEmailHandler)
-func Register[Req, Resp any](s *System, name string, fn func(ctx context.Context, req Req) (Resp, error)) {
+func Register[Req, Resp any](s *Runtime, name string, fn func(ctx context.Context, req Req) (Resp, error)) {
     s.registry[name] = JobFn[Req, Resp](fn)
 }
 
 // Dispatch creates the job row and prefers to acquire the lease and run the handler
 // locally in a goroutine. If the job already exists, Dispatch polls job_status until
 // the job reaches a terminal state and returns.
-func (js *System) Dispatch(
+func (r *Runtime) Dispatch(
     ctx context.Context, db DBTX, name string, req any, idempotencyKey string,
 ) (*Job, error) {
     raw, err := json.Marshal(req)
@@ -295,7 +295,7 @@ func (js *System) Dispatch(
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name, idempotency_key) DO NOTHING
         RETURNING id, idempotency_key, name, namespace`,
-        uuid.New(), key, name, js.namespace, buildSHA, hostname, raw,
+        uuid.New(), key, name, r.namespace, buildSHA, hostname, raw,
     ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
     if err == pgx.ErrNoRows {
         // Job already exists — fetch it.
@@ -317,7 +317,7 @@ func (js *System) Dispatch(
     }
 
     // Newly created job: create and acquire the lease atomically with the job row.
-    lease, err := js.leases.CreateAndAcquire(ctx, tx, js.namespace, job.ID.String(), hostname, leaseDuration)
+    lease, err := r.leases.CreateAndAcquire(ctx, tx, r.namespace, job.ID.String(), hostname, leaseDuration)
     if err != nil {
         return nil, fmt.Errorf("create and acquire lease: %w", err)
     }
@@ -338,7 +338,7 @@ func (js *System) Dispatch(
 
     // TODO: we should be using the job system context but after extracting
     // relevant context fields.
-    go js.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
+    go r.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
 
     return &job, nil
 }
@@ -347,7 +347,7 @@ func (js *System) Dispatch(
 // idempotencyKey is required. If a job with this (name, key) already exists, Run polls
 // job_status until the job reaches a terminal state, then returns the result.
 // dest is a pointer to the response type that the result will be unmarshaled into.
-func (js *System) Run(
+func (js *Runtime) Run(
     ctx context.Context, db DBTX, name string, req any, idempotencyKey string, dest any,
 ) error {
     if idempotencyKey == "" {
@@ -425,7 +425,7 @@ func (js *System) Run(
 
 // pollForCompletion polls job_status until the job reaches a terminal state.
 // Used by Dispatch() when a running duplicate is detected.
-func (js *System) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUID) error {
+func (js *Runtime) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUID) error {
     ticker := time.NewTicker(1 * time.Second)
     defer ticker.Stop()
     for {
@@ -454,7 +454,7 @@ func (js *System) pollForCompletion(ctx context.Context, db DBTX, jobID uuid.UUI
 // pollForResult polls job_status until the job reaches a terminal state,
 // then fetches the response from job_attempts. Used by Run() for duplicate detection.
 // See the Optimizations section for an optimized implementation of polling results
-func (js *System) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (json.RawMessage, error) {
+func (js *Runtime) pollForResult(ctx context.Context, db DBTX, jobID uuid.UUID) (json.RawMessage, error) {
     ticker := time.NewTicker(500 * time.Millisecond)
     defer ticker.Stop()
     for {
@@ -529,7 +529,7 @@ The system only claims job types that are registered locally,
 ensuring unknown job types are never silently dropped.
 
 ```go
-func (js *System) claimBatch(ctx context.Context) ([]*Attempt, error) {
+func (js *Runtime) claimBatch(ctx context.Context) ([]*Attempt, error) {
     tx, err := js.db.BeginTx(ctx, nil)
     if err != nil {
         return nil, err
@@ -618,7 +618,7 @@ Before executing, each claimed job is validated:
    stale work from a previous session.
 
 ```go
-func (js *System) validate(job *Job, nextAttemptNo int) error {
+func (js *Runtime) validate(job *Job, nextAttemptNo int) error {
     if _, ok := js.registry[job.Name]; !ok {
         return fmt.Errorf("unknown job type %q", job.Name)
     }
@@ -652,7 +652,7 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
                                          ↘ Fail     → [pending_retry] or [failed]
 ```
 
-1. System claims a batch of leases (in a transaction).
+1. Runtime claims a batch of leases (in a transaction).
 2. In the same transaction, for each lease, the job is validated and a new
    `job_attempts` row is inserted. The lease acquisition and attempt insertion
    are atomic.
@@ -674,7 +674,7 @@ Dispatch → [pending] → Claim → [running] → Complete → [complete]
 ```go
 // complete must be called within a transaction so the response write and lease
 // deletion are atomic — a crash between them would leave the job in an inconsistent state.
-func (js *System) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
+func (js *Runtime) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -694,7 +694,7 @@ func (js *System) complete(ctx context.Context, tx DBTX, job *Job, attempt *Atte
 // fail records the error on the current attempt. On permanent failure, the lease
 // is deleted. On transient failure, the lease is retained — the caller (runWithRetry)
 // is responsible for sleeping the backoff duration and inserting the next attempt row.
-func (js *System) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, execErr error) error {
+func (js *Runtime) fail(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, execErr error) error {
     _, err := tx.ExecContext(ctx,
         `UPDATE job_attempts SET error = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -733,7 +733,7 @@ state (caches, connections).
 // runWithRetry executes the job handler, retrying locally on transient failure.
 // The lease is held for the entire retry loop; it is deleted on success or
 // permanent failure, and released on context cancellation (graceful termination).
-func (js *System) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) (json.RawMessage, error) {
+func (js *Runtime) runWithRetry(ctx context.Context, db DBTX, job *Job, attempt *Attempt) (json.RawMessage, error) {
     for {
         resp, execErr := js.registry[job.Name].Handle(ctx, attempt.Request)
         if execErr == nil {
@@ -945,7 +945,7 @@ heartbeats fail consistently (e.g. DB unavailable), the worker self-terminates
 to release all claims via lease expiry.
 
 ```go
-func (js *System) heartbeatLoop(ctx context.Context) {
+func (js *Runtime) heartbeatLoop(ctx context.Context) {
     ticker := time.NewTicker(heartbeatInterval)
     defer ticker.Stop()
 
@@ -1005,8 +1005,8 @@ type cancelJobRequest struct {
     Broadcast   bool      `json:"broadcast"`
 }
 
-// registerSystemJobs wires up internal system jobs at startup.
-func (js *System) registerSystemJobs() {
+// registerRuntimeJobs wires up internal system jobs at startup.
+func (js *Runtime) registerRuntimeJobs() {
     js.Register("__system:cancel_job", jobs.JobFn(func(ctx context.Context, req cancelJobRequest) (struct{}, error) {
         if req.Broadcast {
             // Broadcast first so the running handler can begin stopping immediately.
@@ -1055,7 +1055,7 @@ type activeJob struct {
 }
 
 // Each running job gets a cancellable context stored by job ID.
-func (js *System) handleCancelNotify(rw http.ResponseWriter, r *http.Request) {
+func (js *Runtime) handleCancelNotify(rw http.ResponseWriter, r *http.Request) {
     var req cancelJobRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(rw, "bad request", http.StatusBadRequest)
@@ -1201,7 +1201,7 @@ Fields are registered at startup. The system uses
 `reflect.TypeOf(field).Name()` as the storage key.
 
 ```go
-func (js *System) RegisterContextField(field ContextField) {
+func (js *Runtime) RegisterContextField(field ContextField) {
     key := reflect.TypeOf(field).Name()
     js.contextFields[key] = field
 }
@@ -1218,7 +1218,7 @@ registered fields against the caller's context and writes non-nil
 results into `metadata["system"]`:
 
 ```go
-func (js *System) extractContext(ctx context.Context, metadata map[string]any) map[string]any {
+func (js *Runtime) extractContext(ctx context.Context, metadata map[string]any) map[string]any {
     if metadata == nil {
         metadata = make(map[string]any)
     }
@@ -1240,7 +1240,7 @@ Before invoking the handler, the system reads
 `metadata["system"]` and calls `Inject` for each registered field:
 
 ```go
-func (js *System) rehydrateContext(ctx context.Context, metadata map[string]any) context.Context {
+func (js *Runtime) rehydrateContext(ctx context.Context, metadata map[string]any) context.Context {
     raw, ok := metadata["system"]
     if !ok {
         return ctx
@@ -1321,7 +1321,7 @@ in logs. Always use the `Context` variants of slog methods (`InfoContext`,
 log output.
 
 ```go
-func (js *System) execute(ctx context.Context, job *Job, attempt *Attempt) error {
+func (js *Runtime) execute(ctx context.Context, job *Job, attempt *Attempt) error {
     log := slog.With("job_id", job.ID, "job_name", job.Name, "attempt_no", attempt.AttemptNo)
     log.InfoContext(ctx, "job started")
 
@@ -1347,7 +1347,7 @@ The worker emits OTel spans and metrics:
   - `jobs.queue_depth` — gauge of unclaimed jobs per namespace (sampled during claim polling)
 
 ```go
-func (js *System) execute(ctx context.Context, job *Job, attempt *Attempt) error {
+func (js *Runtime) execute(ctx context.Context, job *Job, attempt *Attempt) error {
     ctx, span := tracer.Start(ctx, "job.execute",
         trace.WithAttributes(
             attribute.String("job.name", job.Name),
@@ -1381,7 +1381,7 @@ allow in-flight jobs to finish before the process exits.
 5. **Exit** — the process exits cleanly.
 
 ```go
-func (js *System) Shutdown() {
+func (js *Runtime) Shutdown() {
     // 1. Stop the poll loop.
     js.stopPoll()
 
@@ -1462,9 +1462,9 @@ application internals.
 ```go
 // main.go or wiring.go
 
-func wire(db *pgxpool.Pool, mailer *Mailer, billingClient *BillingClient) *jobs.System {
-    // Namespace is configured once on the System; it is not a per-call argument.
-    sys := jobs.NewSystem(db, leaseStore, jobs.Config{
+func wire(db *pgxpool.Pool, mailer *Mailer, billingClient *BillingClient) *jobs.Runtime {
+    // Namespace is configured once on the Runtime; it is not a per-call argument.
+    sys := jobs.NewRuntime(db, leaseStore, jobs.Config{
         Namespace:    "default",
         BatchSize:    10,
         PollInterval: 2 * time.Second,
@@ -1491,7 +1491,7 @@ wired in one central file:
 ```go
 // jobs/send_welcome_email.go
 
-func Register(sys *jobs.System, mailer *Mailer) {
+func Register(sys *jobs.Runtime, mailer *Mailer) {
     syjs.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
         msgID, err := mailer.Send(ctx, req.Email, welcomeTemplate)
         if err != nil {
@@ -1676,7 +1676,7 @@ view, which derives state from `jobs` and `job_attempts`.
 
 | Event | Status written | Where |
 |---|---|---|
-| System claims lease + inserts attempt | `running` | Inside `claimBatch` tx |
+| Runtime claims lease + inserts attempt | `running` | Inside `claimBatch` tx |
 | Job completes successfully | `completed` | Inside `complete()` tx |
 | Transient failure (retry remaining) | _(no change — stays `running`)_ | — |
 | Permanent failure (no retries) | `failed` | Inside `fail()` tx |
@@ -1686,7 +1686,7 @@ view, which derives state from `jobs` and `job_attempts`.
 Example — updating status inside `complete()`:
 
 ```go
-func (js *System) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
+func (js *Runtime) complete(ctx context.Context, tx DBTX, job *Job, attempt *Attempt, resp json.RawMessage) error {
     _, err := tx.Exec(ctx,
         `UPDATE job_attempts SET response = $1, finished_at = now()
          WHERE job_id = $2 AND attempt_no = $3`,
@@ -1832,7 +1832,7 @@ This reduces connection usage from O(N) to O(1) per tick. Callers block on a
 channel instead of holding a connection:
 
 ```go
-func (js *System) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
+func (r *Runtime) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
     ch := js.poller.Subscribe(jobID, false)
     select {
     case <-ctx.Done():
