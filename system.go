@@ -35,10 +35,20 @@ type JobConfig struct {
 type Config struct {
 	// Namespace is the logical grouping for all jobs dispatched by this Runtime.
 	Namespace string
-	// PollInterval controls how often pollForCompletion and pollForResult tick.
+	// PollInterval controls how often the claim loop and completion pollers tick.
 	// Defaults to 2s if zero.
 	// TODO(PR 6): replaced by statusPoller which batches all active subscriptions.
 	PollInterval time.Duration
+	// BatchSize is the maximum number of jobs claimed per poll cycle.
+	// Defaults to 10 if zero.
+	BatchSize int
+	// DevMode enables the stale job guard: jobs older than StaleThreshold are
+	// skipped instead of executed. Useful in local development to avoid
+	// re-executing stale work from a previous session.
+	DevMode bool
+	// StaleThreshold is the age cutoff for the dev-mode stale job guard.
+	// Defaults to 24h if zero when DevMode is true.
+	StaleThreshold time.Duration
 	// BuildSHA is the git SHA of the binary used for tracing/attribution.
 	// Set by the caller; leave empty if not needed.
 	BuildSHA string
@@ -53,16 +63,19 @@ type registeredJob struct {
 // Runtime is the top-level struct that handles both dispatching and executing
 // jobs. Namespace is a system-wide configuration set at startup.
 //
-// TODO(PR 3): add claim loop fields (batchSize, pollTicker, Start/Stop).
 // TODO(PR 4): add activeJobs map for heartbeat tracking.
 // TODO(PR 6): add statusPoller for batched completion polling.
 type Runtime struct {
-	namespace    string
-	db           DB
-	leases       leases.Store
-	registry     map[string]registeredJob
-	buildSHA     string
-	pollInterval time.Duration
+	namespace      string
+	db             DB
+	leases         leases.Store
+	registry       map[string]registeredJob
+	buildSHA       string
+	pollInterval   time.Duration
+	batchSize      int
+	devMode        bool
+	staleThreshold time.Duration
+	stopCh         chan struct{}
 }
 
 // NewRuntime constructs a Runtime with the given database, lease store, and config.
@@ -71,13 +84,25 @@ func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = 10
+	}
+	staleThreshold := cfg.StaleThreshold
+	if staleThreshold <= 0 {
+		staleThreshold = 24 * time.Hour
+	}
 	return &Runtime{
-		namespace:    cfg.Namespace,
-		db:           db,
-		leases:       ls,
-		registry:     make(map[string]registeredJob),
-		buildSHA:     cfg.BuildSHA,
-		pollInterval: pollInterval,
+		namespace:      cfg.Namespace,
+		db:             db,
+		leases:         ls,
+		registry:       make(map[string]registeredJob),
+		buildSHA:       cfg.BuildSHA,
+		pollInterval:   pollInterval,
+		batchSize:      batchSize,
+		devMode:        cfg.DevMode,
+		staleThreshold: staleThreshold,
+		stopCh:         make(chan struct{}),
 	}
 }
 
