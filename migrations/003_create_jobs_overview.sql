@@ -1,3 +1,8 @@
+-- Compatible with PostgreSQL 12+ and CockroachDB 22.1+.
+-- LEFT JOIN LATERAL is supported in CockroachDB since v21.1 and in
+-- PostgreSQL since v9.3. CASE expressions and views are fully supported
+-- by both engines.
+--
 -- jobs_overview is the canonical way to observe job state. It joins jobs with
 -- the most recent attempt, including jobs that have never been attempted.
 -- Use this view for debugging and ad-hoc investigation; do not use it in

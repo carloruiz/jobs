@@ -1,3 +1,6 @@
+-- Compatible with PostgreSQL 12+ and CockroachDB 22.1+.
+-- Foreign keys, composite primary keys, JSONB, and TIMESTAMPTZ are all
+-- supported identically by both engines.
 CREATE TABLE job_attempts (
     job_id           UUID        NOT NULL REFERENCES jobs(id),
     attempt_no       INT         NOT NULL,              -- 1-indexed

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/carloruiz/leases"
@@ -12,10 +13,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// DBTX is satisfied by *pgxpool.Pool, *pgx.Conn, and pgx.Tx, allowing job
+// DB is satisfied by *pgxpool.Pool, *pgx.Conn, and pgx.Tx, allowing job
 // system operations to run against either a connection pool or an existing
 // transaction.
-type DBTX interface {
+type DB interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -47,11 +48,23 @@ func (f JobFn[Req, Resp]) Handle(ctx context.Context, raw json.RawMessage) (json
 	return json.Marshal(resp)
 }
 
-// BackoffPolicy defines the per-attempt delay schedule for a job type.
-// DelaySeconds is a list of wait durations indexed by attempt number (0-based).
-// If the attempt index exceeds the list length, the last value is used.
+// BackoffPolicy defines the exponential back-off schedule for a job type.
+// Duration computes the delay before attempt n (0-based) using:
+//
+//	min(InitialInterval * Multiplier^n, MaxInterval)
 type BackoffPolicy struct {
-	DelaySeconds []int `json:"delay_seconds"`
+	InitialInterval time.Duration `json:"initial_interval"`
+	Multiplier      float64       `json:"multiplier"`
+	MaxInterval     time.Duration `json:"max_interval"`
+}
+
+// Duration returns the delay that should elapse before attempt n (0-based).
+func (b BackoffPolicy) Duration(attempt int) time.Duration {
+	d := float64(b.InitialInterval) * math.Pow(b.Multiplier, float64(attempt))
+	if time.Duration(d) >= b.MaxInterval {
+		return b.MaxInterval
+	}
+	return time.Duration(d)
 }
 
 // Job represents a single unit of work. Rows are immutable after insertion.
@@ -67,7 +80,7 @@ type Job struct {
 	CreatedAt      time.Time
 	CreatorSHA     string
 	CreatorHost    string
-	BackoffPolicy  json.RawMessage
+	BackoffPolicy  BackoffPolicy
 	Deadline       *time.Time
 }
 
