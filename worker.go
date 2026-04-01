@@ -2,7 +2,6 @@ package jobs
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -113,27 +112,12 @@ func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
 		return nil, fmt.Errorf("load jobs: %w", err)
 	}
 
-	type scannedRow struct {
-		job           Job
-		lastAttemptNo int
-		lastStartedAt *time.Time
-	}
-	var scanned []scannedRow
+	var scanned []scannedJobRow
 	for rows.Next() {
-		var sr scannedRow
-		var backoffJSON []byte
-		if scanErr := rows.Scan(
-			&sr.job.ID, &sr.job.Name, &sr.job.Namespace,
-			&sr.job.MaxAttempts, &sr.job.RetryUntil,
-			&backoffJSON, &sr.job.Deadline, &sr.job.Request, &sr.job.CreatedAt,
-			&sr.lastAttemptNo, &sr.lastStartedAt,
-		); scanErr != nil {
+		sr, scanErr := scanJobRow(rows)
+		if scanErr != nil {
 			rows.Close()
-			return nil, fmt.Errorf("scan job row: %w", scanErr)
-		}
-		if parseErr := json.Unmarshal(backoffJSON, &sr.job.BackoffPolicy); parseErr != nil {
-			rows.Close()
-			return nil, fmt.Errorf("unmarshal backoff policy for job %s: %w", sr.job.ID, parseErr)
+			return nil, scanErr
 		}
 		scanned = append(scanned, sr)
 	}
@@ -153,10 +137,8 @@ func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
 			continue
 		}
 
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha) VALUES ($1, $2, $3, $4)`,
-			job.ID, nextAttemptNo, hostname, r.buildSHA,
-		); err != nil {
+		// TODO(future): batch these inserts into a single round-trip.
+		if err := insertAttemptRow(ctx, tx, job.ID, nextAttemptNo, hostname, r.buildSHA); err != nil {
 			return nil, fmt.Errorf("insert attempt for job %s: %w", job.ID, err)
 		}
 
@@ -204,9 +186,6 @@ func (r *Runtime) validate(job *Job, nextAttemptNo int, lastStartedAt *time.Time
 			return ErrBackoffNotElapsed
 		}
 	}
-	if r.devMode && time.Since(job.CreatedAt) > r.staleThreshold {
-		return ErrStaleJobSkipped
-	}
 	return nil
 }
 
@@ -216,22 +195,15 @@ func (r *Runtime) handleValidationError(
 	ctx context.Context, tx pgx.Tx, job *Job, lastAttemptNo int, token leases.LeaseToken, err error,
 ) {
 	switch {
-	case errors.Is(err, ErrBackoffNotElapsed), errors.Is(err, ErrStaleJobSkipped):
+	case errors.Is(err, ErrBackoffNotElapsed):
 		// Transient skip: release the lease so another worker can re-claim later.
 		_ = r.leases.Release(ctx, tx, job.ID.String(), token)
 
 	case errors.Is(err, ErrMaxAttemptsExceeded), errors.Is(err, ErrDeadlineExceeded):
-		// Permanent failure: record the terminal error on the last attempt (if
-		// it hasn't already been finished), then delete the lease.
-		if lastAttemptNo > 0 {
-			errJSON, _ := json.Marshal(map[string]string{"message": err.Error()})
-			_, _ = tx.Exec(ctx,
-				`UPDATE job_attempts
-				 SET error = $1, finished_at = COALESCE(finished_at, now())
-				 WHERE job_id = $2 AND attempt_no = $3`,
-				errJSON, job.ID, lastAttemptNo,
-			)
-		}
+		// Permanent failure: append a terminal attempt row recording the error,
+		// then delete the lease. The attempts table is append-only; never update.
+		// TODO(PR 7): log structured error here.
+		_ = insertFailedAttemptRow(ctx, tx, job.ID, lastAttemptNo+1, hostname, r.buildSHA, err.Error())
 		_ = r.leases.Delete(ctx, tx, job.ID.String())
 
 	default:

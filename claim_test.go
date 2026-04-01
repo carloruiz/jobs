@@ -267,13 +267,21 @@ func TestIntegration_ClaimLoop_DeadlineExceeded(t *testing.T) {
 		t.Error("handler should not have been called for a job past its deadline")
 	}
 
-	// The attempt row should still be 0 (no execution).
+	// A single terminal attempt row should have been inserted with the error.
 	var attemptCount int
 	pool.QueryRow(context.Background(),
 		`SELECT COUNT(*) FROM job_attempts WHERE job_id = $1`, jobID,
 	).Scan(&attemptCount)
-	if attemptCount != 0 {
-		t.Errorf("expected 0 attempts for a deadline-exceeded job, got %d", attemptCount)
+	if attemptCount != 1 {
+		t.Errorf("expected 1 terminal attempt for a deadline-exceeded job, got %d", attemptCount)
+	}
+
+	var errPayload []byte
+	pool.QueryRow(context.Background(),
+		`SELECT error FROM job_attempts WHERE job_id = $1 AND attempt_no = 1`, jobID,
+	).Scan(&errPayload)
+	if len(errPayload) == 0 {
+		t.Error("expected terminal attempt to have error set")
 	}
 }
 
@@ -319,12 +327,21 @@ func TestIntegration_ClaimLoop_MaxAttemptsExceeded(t *testing.T) {
 		t.Error("handler should not have been called for an exhausted job")
 	}
 
-	// The attempt count should still be 1.
+	// Expect 2 attempt rows: the original failed attempt plus the terminal row
+	// appended by handleValidationError when max attempts is exceeded.
 	var attemptCount int
 	pool.QueryRow(context.Background(),
 		`SELECT COUNT(*) FROM job_attempts WHERE job_id = $1`, jobID,
 	).Scan(&attemptCount)
-	if attemptCount != 1 {
-		t.Errorf("expected 1 attempt (existing), got %d", attemptCount)
+	if attemptCount != 2 {
+		t.Errorf("expected 2 attempts (original + terminal), got %d", attemptCount)
+	}
+
+	var terminalError []byte
+	pool.QueryRow(context.Background(),
+		`SELECT error FROM job_attempts WHERE job_id = $1 AND attempt_no = 2`, jobID,
+	).Scan(&terminalError)
+	if len(terminalError) == 0 {
+		t.Error("expected terminal attempt (attempt_no=2) to have error set")
 	}
 }

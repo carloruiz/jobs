@@ -42,13 +42,6 @@ type Config struct {
 	// BatchSize is the maximum number of jobs claimed per poll cycle.
 	// Defaults to 10 if zero.
 	BatchSize int
-	// DevMode enables the stale job guard: jobs older than StaleThreshold are
-	// skipped instead of executed. Useful in local development to avoid
-	// re-executing stale work from a previous session.
-	DevMode bool
-	// StaleThreshold is the age cutoff for the dev-mode stale job guard.
-	// Defaults to 24h if zero when DevMode is true.
-	StaleThreshold time.Duration
 	// BuildSHA is the git SHA of the binary used for tracing/attribution.
 	// Set by the caller; leave empty if not needed.
 	BuildSHA string
@@ -66,16 +59,14 @@ type registeredJob struct {
 // TODO(PR 4): add activeJobs map for heartbeat tracking.
 // TODO(PR 6): add statusPoller for batched completion polling.
 type Runtime struct {
-	namespace      string
-	db             DB
-	leases         leases.Store
-	registry       map[string]registeredJob
-	buildSHA       string
-	pollInterval   time.Duration
-	batchSize      int
-	devMode        bool
-	staleThreshold time.Duration
-	stopCh         chan struct{}
+	namespace    string
+	db           DB
+	leases       leases.Store
+	registry     map[string]registeredJob
+	buildSHA     string
+	pollInterval time.Duration
+	batchSize    int
+	stopCh       chan struct{}
 }
 
 // NewRuntime constructs a Runtime with the given database, lease store, and config.
@@ -88,21 +79,15 @@ func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
 	if batchSize <= 0 {
 		batchSize = 10
 	}
-	staleThreshold := cfg.StaleThreshold
-	if staleThreshold <= 0 {
-		staleThreshold = 24 * time.Hour
-	}
 	return &Runtime{
-		namespace:      cfg.Namespace,
-		db:             db,
-		leases:         ls,
-		registry:       make(map[string]registeredJob),
-		buildSHA:       cfg.BuildSHA,
-		pollInterval:   pollInterval,
-		batchSize:      batchSize,
-		devMode:        cfg.DevMode,
-		staleThreshold: staleThreshold,
-		stopCh:         make(chan struct{}),
+		namespace:    cfg.Namespace,
+		db:           db,
+		leases:       ls,
+		registry:     make(map[string]registeredJob),
+		buildSHA:     cfg.BuildSHA,
+		pollInterval: pollInterval,
+		batchSize:    batchSize,
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -156,32 +141,20 @@ func (r *Runtime) Dispatch(
 	}
 	defer tx.Rollback(ctx)
 
-	var job Job
-	err = tx.QueryRow(ctx, `
-		INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request, max_attempts, backoff_policy)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (name, idempotency_key) DO NOTHING
-		RETURNING id, idempotency_key, name, namespace`,
-		uuid.New(), key, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON,
-	).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Conflict: a job with this key already exists — fetch and return it.
-		err = tx.QueryRow(ctx, `
-			SELECT id, idempotency_key, name, namespace FROM jobs
-			WHERE name = $1 AND idempotency_key = $2`,
-			name, key,
-		).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+	job, conflict, err := upsertJobRow(ctx, tx, uuid.New(), key, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON)
+	if err != nil {
+		return nil, fmt.Errorf("insert job: %w", err)
+	}
+	if conflict {
+		// A job with this key already exists — fetch and return it.
+		job, err = fetchJobByKey(ctx, tx, name, key)
 		if err != nil {
-			return nil, fmt.Errorf("fetch existing job: %w", err)
+			return nil, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit: %w", err)
 		}
 		return &job, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("insert job: %w", err)
 	}
 
 	lease, err := r.leases.CreateAndAcquire(ctx, tx, r.namespace, job.ID.String(), hostname, leaseDuration)
@@ -189,11 +162,7 @@ func (r *Runtime) Dispatch(
 		return nil, fmt.Errorf("create and acquire lease: %w", err)
 	}
 
-	if _, err = tx.Exec(ctx,
-		`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
-		 VALUES ($1, 1, $2, $3)`,
-		job.ID, hostname, r.buildSHA,
-	); err != nil {
+	if err := insertAttemptRow(ctx, tx, job.ID, 1, hostname, r.buildSHA); err != nil {
 		return nil, fmt.Errorf("insert attempt: %w", err)
 	}
 
@@ -252,24 +221,15 @@ func (r *Runtime) Run(
 	}
 	defer tx.Rollback(ctx)
 
-	var job Job
-	err = tx.QueryRow(ctx, `
-		INSERT INTO jobs (id, idempotency_key, name, namespace, creator_sha, creator_host, request, max_attempts, backoff_policy)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		ON CONFLICT (name, idempotency_key) DO NOTHING
-		RETURNING id, idempotency_key, name, namespace`,
-		uuid.New(), idempotencyKey, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON,
-	).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Conflict: job already exists — poll for its result.
-		err = tx.QueryRow(ctx, `
-			SELECT id, idempotency_key, name, namespace FROM jobs
-			WHERE name = $1 AND idempotency_key = $2`,
-			name, idempotencyKey,
-		).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
+	job, conflict, err := upsertJobRow(ctx, tx, uuid.New(), idempotencyKey, name, r.namespace, r.buildSHA, hostname, raw, jreg.config.MaxAttempts, backoffJSON)
+	if err != nil {
+		return fmt.Errorf("insert job: %w", err)
+	}
+	if conflict {
+		// Job already exists — poll for its result.
+		job, err = fetchJobByKey(ctx, tx, name, idempotencyKey)
 		if err != nil {
-			return fmt.Errorf("fetch existing job: %w", err)
+			return err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit: %w", err)
@@ -280,20 +240,13 @@ func (r *Runtime) Run(
 		}
 		return json.Unmarshal(resultRaw, dest)
 	}
-	if err != nil {
-		return fmt.Errorf("insert job: %w", err)
-	}
 
 	lease, err := r.leases.CreateAndAcquire(ctx, tx, r.namespace, job.ID.String(), hostname, leaseDuration)
 	if err != nil {
 		return fmt.Errorf("create and acquire lease: %w", err)
 	}
 
-	if _, err = tx.Exec(ctx,
-		`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha)
-		 VALUES ($1, 1, $2, $3)`,
-		job.ID, hostname, r.buildSHA,
-	); err != nil {
+	if err := insertAttemptRow(ctx, tx, job.ID, 1, hostname, r.buildSHA); err != nil {
 		return fmt.Errorf("insert attempt: %w", err)
 	}
 
@@ -402,10 +355,7 @@ func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *At
 		}
 
 		nextNo := attempt.AttemptNo + 1
-		if _, err := db.Exec(ctx,
-			`INSERT INTO job_attempts (job_id, attempt_no, executor_host, executor_sha) VALUES ($1, $2, $3, $4)`,
-			job.ID, nextNo, hostname, r.buildSHA,
-		); err != nil {
+		if err := insertAttemptRow(ctx, db, job.ID, nextNo, hostname, r.buildSHA); err != nil {
 			return nil, fmt.Errorf("insert next attempt: %w", err)
 		}
 
