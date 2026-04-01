@@ -258,13 +258,25 @@ call (e.g. due to a network timeout after the INSERT succeeded).
 **Signatures:**
 
 ```go
+// Register registers a typed handler for the given job name. Go infers the
+// type parameters from fn, so callers never write explicit type annotations:
+//
+//     jobs.Register(sys, "send_email", sendEmailHandler)
+func Register[Req, Resp any](s *System, name string, fn func(ctx context.Context, req Req) (Resp, error)) {
+    s.registry[name] = JobFn[Req, Resp](fn)
+}
+
 // Dispatch creates the job row and prefers to acquire the lease and run the handler
 // locally in a goroutine. If the job already exists, Dispatch polls job_status until
 // the job reaches a terminal state and returns.
-// req must be a valid JSON-encoded payload.
 func (js *System) Dispatch(
-    ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string,
+    ctx context.Context, db DBTX, name string, req any, idempotencyKey string,
 ) (*Job, error) {
+    raw, err := json.Marshal(req)
+    if err != nil {
+        return nil, fmt.Errorf("marshal request: %w", err)
+    }
+
     key := idempotencyKey
     if key == "" {
         key = uuid.NewString()
@@ -283,7 +295,7 @@ func (js *System) Dispatch(
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name, idempotency_key) DO NOTHING
         RETURNING id, idempotency_key, name, namespace`,
-        uuid.New(), key, name, js.namespace, buildSHA, hostname, req,
+        uuid.New(), key, name, js.namespace, buildSHA, hostname, raw,
     ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
     if err == pgx.ErrNoRows {
         // Job already exists — fetch it.
@@ -334,13 +346,17 @@ func (js *System) Dispatch(
 // Run creates the job, acquires the lease locally, and executes the handler in-process.
 // idempotencyKey is required. If a job with this (name, key) already exists, Run polls
 // job_status until the job reaches a terminal state, then returns the result.
-// req must be a valid JSON-encoded payload. dest is a pointer to the response type that
-// the result will be unmarshaled into.
+// dest is a pointer to the response type that the result will be unmarshaled into.
 func (js *System) Run(
-    ctx context.Context, db DBTX, name string, req json.RawMessage, idempotencyKey string, dest any,
+    ctx context.Context, db DBTX, name string, req any, idempotencyKey string, dest any,
 ) error {
     if idempotencyKey == "" {
         return fmt.Errorf("Run: idempotencyKey is required")
+    }
+
+    raw, err := json.Marshal(req)
+    if err != nil {
+        return fmt.Errorf("marshal request: %w", err)
     }
 
     // Begin a transaction (or savepoint if db is already a pgx.Tx).
@@ -356,7 +372,7 @@ func (js *System) Run(
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name, idempotency_key) DO NOTHING
         RETURNING id, idempotency_key, name, namespace`,
-        uuid.New(), idempotencyKey, name, js.namespace, buildSHA, hostname, req,
+        uuid.New(), idempotencyKey, name, js.namespace, buildSHA, hostname, raw,
     ).Scan(&job.ID, &job.IdempotencyKey, &job.Name, &job.Namespace)
     if err == pgx.ErrNoRows {
         // Job already exists — fetch it.
@@ -797,10 +813,9 @@ if time.Now().Before(nextAllowedAt) {
 **Invariant: all request and response payloads must be valid JSON.** This is
 enforced at every public interface boundary:
 
-- `Dispatch(req json.RawMessage, ...)` and `Run(req json.RawMessage, ...)`
-  accept `json.RawMessage`, which is a named `[]byte` type that signals the
-  JSON contract to callers. Passing non-JSON bytes is a programming error; the
-  system validates the payload is non-nil and well-formed before inserting it.
+- `Dispatch(req any, ...)` and `Run(req any, ...)` accept any
+  JSON-serializable value and marshal it internally via `json.Marshal`.
+  Callers pass plain Go structs — no manual marshaling required.
 - Handlers registered via `JobFn` automatically produce valid JSON responses
   via `json.Marshal`. Custom `Handler` implementations that produce raw bytes
   must ensure their output is valid JSON — this is checked at
@@ -854,27 +869,28 @@ type SendWelcomeEmailResponse struct {
 }
 ```
 
-Call sites register jobs directly using `JobFn`:
+Call sites register jobs using the top-level `Register` function. Go
+infers the type parameters from the handler, so no explicit type
+annotations are needed:
 
 ```go
-js.Register("send_welcome_email", jobs.JobFn(func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
+jobs.Register(sys, "send_welcome_email", func(ctx context.Context, req SendWelcomeEmailRequest) (SendWelcomeEmailResponse, error) {
     msgID, err := mailer.Send(ctx, req.Email, welcomeTemplate)
     if err != nil {
         return SendWelcomeEmailResponse{}, err
     }
     return SendWelcomeEmailResponse{MessageID: msgID}, nil
-}))
+})
 ```
 
-At dispatch time, callers marshal their typed request before passing
-it to `Dispatch` or `Run`:
+At dispatch time, callers pass plain Go structs — marshaling is
+handled internally:
 
 ```go
-req, err := json.Marshal(SendWelcomeEmailRequest{UserID: "u_123", Email: "user@example.com"})
-if err != nil {
-    return err
-}
-_, err = sys.Dispatch(ctx, db, "send_welcome_email", json.RawMessage(req), "")
+_, err := sys.Dispatch(ctx, db, "send_welcome_email", SendWelcomeEmailRequest{
+    UserID: "u_123",
+    Email:  "user@example.com",
+}, "")
 ```
 
 > **Why not proto?** Protobuf makes job attempt rows opaque in the database,
