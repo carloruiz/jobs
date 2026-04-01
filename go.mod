@@ -3,7 +3,7 @@ module github.com/carloruiz/jobs
 go 1.25.5
 
 require (
-	github.com/carloruiz/leases v0.2.0
+	github.com/carloruiz/leases v0.3.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.1
 )

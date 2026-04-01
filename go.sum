@@ -1,5 +1,5 @@
-github.com/carloruiz/leases v0.2.0 h1:he2eKsl+w438kXMgcuoaOrmCSzjgaxUl4zcjzBEpbPg=
-github.com/carloruiz/leases v0.2.0/go.mod h1:p/mDlrUx8UcyqaqJL6RcyFh1+HnfDtOhDZuPStzpA4s=
+github.com/carloruiz/leases v0.3.0 h1:MSgGBOWXZB3gS0Fa0jJ7wBxMa+fEi0NM6g6edCbj9IU=
+github.com/carloruiz/leases v0.3.0/go.mod h1:p/mDlrUx8UcyqaqJL6RcyFh1+HnfDtOhDZuPStzpA4s=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
