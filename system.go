@@ -186,7 +186,7 @@ func (r *Runtime) Dispatch(
 		Request:    raw,
 		LeaseToken: lease.Token,
 	}
-	go r.keepRetrying(context.WithoutCancel(ctx), db, &job, attempt)
+	go r.runWithRetry(context.WithoutCancel(ctx), db, &job, attempt)
 	return &job, nil
 }
 
@@ -287,7 +287,7 @@ func (r *Runtime) Run(
 		LeaseToken: lease.Token,
 	}
 
-	resultRaw, err := r.keepRetrying(ctx, db, &job, attempt)
+	resultRaw, err := r.runWithRetry(ctx, db, &job, attempt)
 	if err != nil {
 		return err
 	}
@@ -341,13 +341,13 @@ func (r *Runtime) pollForResult(ctx context.Context, jobID uuid.UUID) (json.RawM
 	return resp, err
 }
 
-// keepRetrying executes the handler, retrying locally on transient failure.
+// runWithRetry executes the handler, retrying locally on transient failure.
 // The lease is held for the full retry loop: deleted on success or permanent
 // failure, released on context cancellation (graceful termination).
 //
 // TODO(PR 3): register/deregister in activeJobs for heartbeat tracking.
 // TODO(PR 8): integrate with graceful shutdown WaitGroup.
-func (r *Runtime) keepRetrying(ctx context.Context, db DB, job *Job, attempt *Attempt) (json.RawMessage, error) {
+func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *Attempt) (json.RawMessage, error) {
 	for {
 		resp, execErr := r.registry[job.Name].handler.Handle(ctx, attempt.Request)
 		if execErr == nil {
