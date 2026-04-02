@@ -65,8 +65,8 @@ type Runtime struct {
 	registry     map[string]registeredJob
 	buildSHA     string
 	pollInterval time.Duration
-	batchSize    int
-	stopCh       chan struct{}
+	claimBatchSize int
+	stopCh         chan struct{}
 }
 
 // NewRuntime constructs a Runtime with the given database, lease store, and config.
@@ -86,7 +86,7 @@ func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
 		registry:     make(map[string]registeredJob),
 		buildSHA:     cfg.BuildSHA,
 		pollInterval: pollInterval,
-		batchSize:    batchSize,
+		claimBatchSize: batchSize,
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -157,12 +157,10 @@ func (r *Runtime) Dispatch(
 	}
 	if conflict {
 		// A job with this key already exists — fetch and return it.
+		// No writes were made; let the deferred rollback clean up the tx.
 		job, err = fetchJobByKey(ctx, tx, name, key)
 		if err != nil {
 			return nil, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit: %w", err)
 		}
 		return &job, nil
 	}
@@ -247,12 +245,10 @@ func (r *Runtime) Run(
 	}
 	if conflict {
 		// Job already exists — poll for its result.
+		// No writes were made; let the deferred rollback clean up the tx.
 		job, err = fetchJobByKey(ctx, tx, name, idempotencyKey)
 		if err != nil {
 			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit: %w", err)
 		}
 		resultRaw, err := r.pollForResult(ctx, job.ID)
 		if err != nil {

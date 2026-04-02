@@ -66,7 +66,7 @@ func (r *Runtime) claimLoop(ctx context.Context) {
 // and loads the corresponding job rows. Returns the job candidates and a map
 // of job ID to lease token.
 func (r *Runtime) acquireAndLoad(ctx context.Context, tx pgx.Tx) ([]scannedJobRow, map[uuid.UUID]leases.LeaseToken, error) {
-	acquiredLeases, err := r.leases.AcquireMany(ctx, tx, r.namespace, r.batchSize, hostname, leaseDuration)
+	acquiredLeases, err := r.leases.AcquireMany(ctx, tx, r.namespace, r.claimBatchSize, hostname, leaseDuration)
 	if err != nil {
 		return nil, nil, fmt.Errorf("acquire leases: %w", err)
 	}
