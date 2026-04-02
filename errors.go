@@ -16,8 +16,4 @@ var (
 	// attempt is less than the configured backoff delay. The lease is released
 	// and the job will be re-encountered on the next poll cycle.
 	ErrBackoffNotElapsed = errors.New("backoff not elapsed")
-
-	// ErrStaleJobSkipped is returned in dev mode when a job is older than the
-	// configured stale threshold.
-	ErrStaleJobSkipped = errors.New("stale job skipped")
 )
