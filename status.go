@@ -23,12 +23,12 @@ const (
 // handle (pool, conn, or tx). Called at every lifecycle event. The call must
 // occur inside the same transaction as the triggering event so that status and
 // execution state remain consistent.
-func upsertJobStatus(ctx context.Context, q DB, jobID uuid.UUID, status string) error {
+func upsertJobStatus(ctx context.Context, q DB, namespace string, jobID uuid.UUID, status string) error {
 	_, err := q.Exec(ctx,
-		`INSERT INTO job_status (job_id, status, updated_at)
-		 VALUES ($1, $2, now())
-		 ON CONFLICT (job_id) DO UPDATE SET status = $2, updated_at = now()`,
-		jobID, status,
+		`INSERT INTO job_status (namespace, job_id, status, updated_at)
+		 VALUES ($1, $2, $3, now())
+		 ON CONFLICT (namespace, job_id) DO UPDATE SET status = $3, updated_at = now()`,
+		namespace, jobID, status,
 	)
 	return err
 }
@@ -47,7 +47,8 @@ func (r *Runtime) GetJobStatus(ctx context.Context, jobID uuid.UUID) (*JobStatus
 	var result JobStatusResult
 	result.JobID = jobID
 	err := r.db.QueryRow(ctx,
-		`SELECT status, updated_at FROM job_status WHERE job_id = $1`, jobID,
+		`SELECT status, updated_at FROM job_status WHERE namespace = $1 AND job_id = $2`,
+		r.namespace, jobID,
 	).Scan(&result.Status, &result.UpdatedAt)
 	if err != nil {
 		return nil, err

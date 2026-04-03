@@ -159,7 +159,7 @@ func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
 			return nil, fmt.Errorf("insert attempt for job %s: %w", job.ID, err)
 		}
 
-		if err := upsertJobStatus(ctx, tx, job.ID, StatusRunning); err != nil {
+		if err := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusRunning); err != nil {
 			return nil, fmt.Errorf("upsert job status for job %s: %w", job.ID, err)
 		}
 
@@ -234,7 +234,7 @@ func (r *Runtime) handleValidationError(
 		}); insertErr != nil {
 			return insertErr
 		}
-		if statusErr := upsertJobStatus(ctx, tx, job.ID, StatusFailed); statusErr != nil {
+		if statusErr := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusFailed); statusErr != nil {
 			return statusErr
 		}
 		return r.leases.Delete(ctx, tx, job.ID.String())

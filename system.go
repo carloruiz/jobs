@@ -192,7 +192,7 @@ func (r *Runtime) Dispatch(
 		return nil, fmt.Errorf("insert attempt: %w", err)
 	}
 
-	if err := upsertJobStatus(ctx, tx, job.ID, StatusRunning); err != nil {
+	if err := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusRunning); err != nil {
 		return nil, fmt.Errorf("upsert job status: %w", err)
 	}
 
@@ -287,7 +287,7 @@ func (r *Runtime) Run(
 		return fmt.Errorf("insert attempt: %w", err)
 	}
 
-	if err := upsertJobStatus(ctx, tx, job.ID, StatusRunning); err != nil {
+	if err := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusRunning); err != nil {
 		return fmt.Errorf("upsert job status: %w", err)
 	}
 
@@ -429,7 +429,7 @@ func (r *Runtime) complete(ctx context.Context, db DB, job *Job, attempt *Attemp
 	); err != nil {
 		return err
 	}
-	if err := upsertJobStatus(ctx, tx, attempt.JobID, StatusCompleted); err != nil {
+	if err := upsertJobStatus(ctx, tx, r.namespace, attempt.JobID, StatusCompleted); err != nil {
 		return fmt.Errorf("upsert job status: %w", err)
 	}
 	if err := r.leases.Delete(ctx, tx, job.ID.String()); err != nil {
@@ -468,7 +468,7 @@ func (r *Runtime) fail(ctx context.Context, db DB, job *Job, attempt *Attempt, e
 	if !keepRetrying {
 		// Permanent failure — update job_status and delete the lease so no
 		// worker ever re-claims it.
-		if err := upsertJobStatus(ctx, tx, attempt.JobID, StatusFailed); err != nil {
+		if err := upsertJobStatus(ctx, tx, r.namespace, attempt.JobID, StatusFailed); err != nil {
 			return false, fmt.Errorf("upsert job status: %w", err)
 		}
 		if err := r.leases.Delete(ctx, tx, job.ID.String()); err != nil {
