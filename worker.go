@@ -159,6 +159,10 @@ func (r *Runtime) claimBatch(ctx context.Context) ([]claimedJob, error) {
 			return nil, fmt.Errorf("insert attempt for job %s: %w", job.ID, err)
 		}
 
+		if err := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusRunning); err != nil {
+			return nil, fmt.Errorf("upsert job status for job %s: %w", job.ID, err)
+		}
+
 		jobCopy := job
 		claimed = append(claimed, claimedJob{
 			job: &jobCopy,
@@ -219,7 +223,8 @@ func (r *Runtime) handleValidationError(
 
 	case errors.Is(err, ErrMaxAttemptsExceeded), errors.Is(err, ErrDeadlineExceeded):
 		// Permanent failure: append a terminal attempt row recording the error,
-		// then delete the lease. The attempts table is append-only; never update.
+		// update job_status, then delete the lease. The attempts table is
+		// append-only; never update.
 		if insertErr := insertFailedAttemptRow(ctx, tx, insertFailedAttemptParams{
 			JobID:     job.ID,
 			AttemptNo: lastAttemptNo + 1,
@@ -228,6 +233,9 @@ func (r *Runtime) handleValidationError(
 			ErrMsg:    err.Error(),
 		}); insertErr != nil {
 			return insertErr
+		}
+		if statusErr := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusFailed); statusErr != nil {
+			return statusErr
 		}
 		return r.leases.Delete(ctx, tx, job.ID.String())
 

@@ -192,6 +192,10 @@ func (r *Runtime) Dispatch(
 		return nil, fmt.Errorf("insert attempt: %w", err)
 	}
 
+	if err := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusRunning); err != nil {
+		return nil, fmt.Errorf("upsert job status: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
@@ -281,6 +285,10 @@ func (r *Runtime) Run(
 
 	if err := insertJobAttemptRow(ctx, tx, insertAttemptParams{JobID: job.ID, AttemptNo: 1, Host: hostname, SHA: r.buildSHA}); err != nil {
 		return fmt.Errorf("insert attempt: %w", err)
+	}
+
+	if err := upsertJobStatus(ctx, tx, r.namespace, job.ID, StatusRunning); err != nil {
+		return fmt.Errorf("upsert job status: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -406,7 +414,8 @@ func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *At
 	}
 }
 
-// complete writes the response and deletes the lease atomically.
+// complete writes the response, updates job_status to completed, and deletes
+// the lease atomically.
 func (r *Runtime) complete(ctx context.Context, db DB, job *Job, attempt *Attempt, resp json.RawMessage) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -419,6 +428,9 @@ func (r *Runtime) complete(ctx context.Context, db DB, job *Job, attempt *Attemp
 		resp, attempt.JobID, attempt.AttemptNo,
 	); err != nil {
 		return err
+	}
+	if err := upsertJobStatus(ctx, tx, r.namespace, attempt.JobID, StatusCompleted); err != nil {
+		return fmt.Errorf("upsert job status: %w", err)
 	}
 	if err := r.leases.Delete(ctx, tx, job.ID.String()); err != nil {
 		return err
@@ -454,7 +466,11 @@ func (r *Runtime) fail(ctx context.Context, db DB, job *Job, attempt *Attempt, e
 	}
 
 	if !keepRetrying {
-		// Permanent failure — delete the lease so no worker ever re-claims it.
+		// Permanent failure — update job_status and delete the lease so no
+		// worker ever re-claims it.
+		if err := upsertJobStatus(ctx, tx, r.namespace, attempt.JobID, StatusFailed); err != nil {
+			return false, fmt.Errorf("upsert job status: %w", err)
+		}
 		if err := r.leases.Delete(ctx, tx, job.ID.String()); err != nil {
 			return false, err
 		}
