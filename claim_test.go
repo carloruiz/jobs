@@ -27,6 +27,7 @@ func applyMigrationsPool(t *testing.T, pool *pgxpool.Pool) {
 		"migrations/001_create_jobs.sql",
 		"migrations/002_create_job_attempts.sql",
 		"migrations/003_create_jobs_overview.sql",
+		"migrations/004_create_job_status.sql",
 	}
 	for _, f := range files {
 		sql, err := os.ReadFile(f)
@@ -46,6 +47,7 @@ func applyMigrationsPool(t *testing.T, pool *pgxpool.Pool) {
 func cleanNamespace(t *testing.T, pool *pgxpool.Pool, ns string) {
 	t.Helper()
 	ctx := context.Background()
+	pool.Exec(ctx, `DELETE FROM job_status WHERE job_id IN (SELECT id FROM jobs WHERE namespace = $1)`, ns)
 	pool.Exec(ctx, `DELETE FROM job_attempts WHERE job_id IN (SELECT id FROM jobs WHERE namespace = $1)`, ns)
 	pool.Exec(ctx, `DELETE FROM jobs WHERE namespace = $1`, ns)
 }

@@ -39,6 +39,7 @@ func applyMigrations(t *testing.T, tx pgx.Tx) {
 		"migrations/001_create_jobs.sql",
 		"migrations/002_create_job_attempts.sql",
 		"migrations/003_create_jobs_overview.sql",
+		"migrations/004_create_job_status.sql",
 	}
 	for _, f := range files {
 		sql, err := os.ReadFile(f)
