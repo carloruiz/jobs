@@ -1,4 +1,4 @@
-package jobs_test
+package jobs
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/carloruiz/jobs"
 	"github.com/carloruiz/leases"
 	"github.com/carloruiz/leases/leasestest"
 	"github.com/google/uuid"
@@ -56,6 +55,23 @@ func (s *heartbeatSpy) setErr(err error) {
 	s.mu.Unlock()
 }
 
+// isStopped reports whether the runtime's stop channel has been closed.
+func isStopped(r *Runtime) bool {
+	select {
+	case <-r.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// activeJobCount returns the number of entries in the activeJobs map.
+func activeJobCount(r *Runtime) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.activeJobs)
+}
+
 // waitFor polls cond until it returns true or the deadline elapses.
 func waitFor(t *testing.T, deadline time.Duration, cond func() bool) bool {
 	t.Helper()
@@ -77,7 +93,7 @@ func waitFor(t *testing.T, deadline time.Duration, cond func() bool) bool {
 // when at least one job is registered in activeJobs.
 func TestHeartbeatLoop_Ticks(t *testing.T) {
 	spy := newHeartbeatSpy()
-	rt := jobs.NewRuntime(nil, spy, jobs.Config{
+	rt := NewRuntime(nil, spy, Config{
 		Namespace:         "hb-ticks",
 		PollInterval:      50 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
@@ -86,8 +102,8 @@ func TestHeartbeatLoop_Ticks(t *testing.T) {
 	// Register a synthetic active job directly (no DB or Dispatch needed).
 	jobID := uuid.New()
 	token := leases.LeaseToken(uuid.NewString())
-	jobs.ExportRegisterActiveJob(rt, jobID, func() {}, token)
-	defer jobs.ExportDeregisterActiveJob(rt, jobID)
+	rt.registerActiveJob(jobID, func() {}, token)
+	defer rt.deregisterActiveJob(jobID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -105,7 +121,7 @@ func TestHeartbeatLoop_Ticks(t *testing.T) {
 // when there are no active jobs.
 func TestHeartbeatLoop_NoCallsWhenIdle(t *testing.T) {
 	spy := newHeartbeatSpy()
-	rt := jobs.NewRuntime(nil, spy, jobs.Config{
+	rt := NewRuntime(nil, spy, Config{
 		Namespace:         "hb-idle",
 		PollInterval:      50 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
@@ -130,7 +146,7 @@ func TestHeartbeatLoop_SelfTermination(t *testing.T) {
 	spy := newHeartbeatSpy()
 	spy.setErr(errors.New("db unavailable"))
 
-	rt := jobs.NewRuntime(nil, spy, jobs.Config{
+	rt := NewRuntime(nil, spy, Config{
 		Namespace:         "hb-terminate",
 		PollInterval:      50 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
@@ -138,8 +154,8 @@ func TestHeartbeatLoop_SelfTermination(t *testing.T) {
 
 	jobID := uuid.New()
 	token := leases.LeaseToken(uuid.NewString())
-	jobs.ExportRegisterActiveJob(rt, jobID, func() {}, token)
-	defer jobs.ExportDeregisterActiveJob(rt, jobID)
+	rt.registerActiveJob(jobID, func() {}, token)
+	defer rt.deregisterActiveJob(jobID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -147,7 +163,7 @@ func TestHeartbeatLoop_SelfTermination(t *testing.T) {
 	rt.Start(ctx)
 
 	// After maxHeartbeatFailures (3) ticks the runtime should call Stop().
-	if !waitFor(t, 2*time.Second, func() bool { return jobs.ExportIsStopped(rt) }) {
+	if !waitFor(t, 2*time.Second, func() bool { return isStopped(rt) }) {
 		t.Errorf("runtime did not self-terminate after consecutive heartbeat failures (got %d HeartbeatMany calls)", spy.callCount())
 	}
 }
@@ -158,7 +174,7 @@ func TestHeartbeatLoop_SelfTermination(t *testing.T) {
 func TestHeartbeatLoop_FailureCounterResets(t *testing.T) {
 	spy := newHeartbeatSpy()
 
-	rt := jobs.NewRuntime(nil, spy, jobs.Config{
+	rt := NewRuntime(nil, spy, Config{
 		Namespace:         "hb-reset",
 		PollInterval:      50 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
@@ -166,8 +182,8 @@ func TestHeartbeatLoop_FailureCounterResets(t *testing.T) {
 
 	jobID := uuid.New()
 	token := leases.LeaseToken(uuid.NewString())
-	jobs.ExportRegisterActiveJob(rt, jobID, func() {}, token)
-	defer jobs.ExportDeregisterActiveJob(rt, jobID)
+	rt.registerActiveJob(jobID, func() {}, token)
+	defer rt.deregisterActiveJob(jobID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -189,7 +205,7 @@ func TestHeartbeatLoop_FailureCounterResets(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 
 	// Runtime should NOT have self-terminated.
-	if jobs.ExportIsStopped(rt) {
+	if isStopped(rt) {
 		t.Error("runtime self-terminated despite non-consecutive heartbeat failures")
 	}
 }
@@ -198,9 +214,9 @@ func TestHeartbeatLoop_FailureCounterResets(t *testing.T) {
 // maintained by registerActiveJob and deregisterActiveJob.
 func TestRegisterDeregisterActiveJob(t *testing.T) {
 	spy := newHeartbeatSpy()
-	rt := jobs.NewRuntime(nil, spy, jobs.Config{Namespace: "hb-register"})
+	rt := NewRuntime(nil, spy, Config{Namespace: "hb-register"})
 
-	if got := jobs.ExportActiveJobCount(rt); got != 0 {
+	if got := activeJobCount(rt); got != 0 {
 		t.Fatalf("expected 0 active jobs, got %d", got)
 	}
 
@@ -208,22 +224,22 @@ func TestRegisterDeregisterActiveJob(t *testing.T) {
 	id2 := uuid.New()
 	tok := leases.LeaseToken(uuid.NewString())
 
-	jobs.ExportRegisterActiveJob(rt, id1, func() {}, tok)
-	jobs.ExportRegisterActiveJob(rt, id2, func() {}, tok)
+	rt.registerActiveJob(id1, func() {}, tok)
+	rt.registerActiveJob(id2, func() {}, tok)
 
-	if got := jobs.ExportActiveJobCount(rt); got != 2 {
+	if got := activeJobCount(rt); got != 2 {
 		t.Fatalf("expected 2 active jobs after registration, got %d", got)
 	}
 
-	jobs.ExportDeregisterActiveJob(rt, id1)
+	rt.deregisterActiveJob(id1)
 
-	if got := jobs.ExportActiveJobCount(rt); got != 1 {
+	if got := activeJobCount(rt); got != 1 {
 		t.Fatalf("expected 1 active job after deregistration, got %d", got)
 	}
 
-	jobs.ExportDeregisterActiveJob(rt, id2)
+	rt.deregisterActiveJob(id2)
 
-	if got := jobs.ExportActiveJobCount(rt); got != 0 {
+	if got := activeJobCount(rt); got != 0 {
 		t.Fatalf("expected 0 active jobs after full deregistration, got %d", got)
 	}
 }
