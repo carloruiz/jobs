@@ -3,7 +3,6 @@ package jobs
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/carloruiz/leases"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 const leaseDuration = 30 * time.Second
@@ -36,9 +34,8 @@ type JobConfig struct {
 type Config struct {
 	// Namespace is the logical grouping for all jobs dispatched by this Runtime.
 	Namespace string
-	// PollInterval controls how often the claim loop and completion pollers tick.
-	// Defaults to 2s if zero.
-	// TODO(PR 6): replaced by statusPoller which batches all active subscriptions.
+	// PollInterval controls how often the claim loop ticks and how often the
+	// statusPoller batches job_status queries. Defaults to 2s if zero.
 	PollInterval time.Duration
 	// HeartbeatInterval controls how often the heartbeat loop renews active leases.
 	// Defaults to 10s if zero.
@@ -65,8 +62,6 @@ type activeJob struct {
 
 // Runtime is the top-level struct that handles both dispatching and executing
 // jobs. Namespace is a system-wide configuration set at startup.
-//
-// TODO(PR 6): add statusPoller for batched completion polling.
 type Runtime struct {
 	namespace      string
 	db             DB
@@ -76,6 +71,7 @@ type Runtime struct {
 	pollInterval   time.Duration
 	claimBatchSize int
 	stopCh         chan struct{}
+	poller         *statusPoller
 
 	heartbeatInterval time.Duration
 	mu                sync.Mutex
@@ -107,6 +103,7 @@ func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
 		claimBatchSize:    batchSize,
 		stopCh:            make(chan struct{}),
 		activeJobs:        make(map[string]*activeJob),
+		poller:            newStatusPoller(db, cfg.Namespace, pollInterval),
 	}
 }
 
@@ -313,41 +310,28 @@ func (r *Runtime) Run(
 	return json.Unmarshal(resultRaw, dest)
 }
 
-// pollForCompletion polls jobs_overview until the job reaches a terminal state.
-// Used by Dispatch() when checking on a running duplicate.
-// TODO(PR 5/6): replace with job_status table + statusPoller.
+// pollForCompletion blocks until the job reaches a terminal state (completed
+// or failed) by subscribing to the single shared statusPoller. Returns nil on
+// success and a descriptive error on failure or context cancellation.
 func (r *Runtime) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
-	ticker := time.NewTicker(r.pollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			var status string
-			err := r.db.QueryRow(ctx,
-				`SELECT status FROM jobs_overview WHERE job_id = $1`, jobID,
-			).Scan(&status)
-			if errors.Is(err, pgx.ErrNoRows) {
-				continue // job not yet visible
-			}
-			if err != nil {
-				return fmt.Errorf("poll status: %w", err)
-			}
-			switch status {
-			case "complete":
-				return nil
-			case "failed":
-				return fmt.Errorf("job %s permanently failed", jobID)
-			}
-			// pending, running, pending_retry — keep polling
+	ch, cancel := r.poller.Subscribe(jobID)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-ch:
+		if result.err != nil {
+			return fmt.Errorf("poll status: %w", result.err)
 		}
+		if result.status == StatusFailed {
+			return fmt.Errorf("job %s permanently failed", jobID)
+		}
+		return nil
 	}
 }
 
-// pollForResult polls for completion then fetches the response payload.
-// Used by Run() when a duplicate idempotency key is detected.
-// TODO(PR 5/6): replace with job_status table + statusPoller.
+// pollForResult blocks until the job completes then fetches the response
+// payload. Used by Run() when a duplicate idempotency key is detected.
 func (r *Runtime) pollForResult(ctx context.Context, jobID uuid.UUID) (json.RawMessage, error) {
 	if err := r.pollForCompletion(ctx, jobID); err != nil {
 		return nil, err

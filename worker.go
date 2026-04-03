@@ -28,8 +28,10 @@ func (r *Runtime) Start(ctx context.Context) {
 	go r.heartbeatLoop(ctx)
 }
 
-// Stop signals the background claim loop to exit. Safe to call multiple times.
+// Stop signals the background claim loop, heartbeat loop, and status poller
+// to exit. Safe to call multiple times.
 func (r *Runtime) Stop() {
+	r.poller.Stop()
 	select {
 	case <-r.stopCh:
 		// already stopped
