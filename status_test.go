@@ -12,41 +12,23 @@ import (
 	"github.com/carloruiz/jobs"
 	"github.com/carloruiz/leases/leasestest"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// queryJobStatus fetches the status from job_status for the given job ID.
-// Returns "" if no row exists.
-func queryJobStatus(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID) string {
-	t.Helper()
-	var status string
-	err := pool.QueryRow(context.Background(),
-		`SELECT status FROM job_status WHERE job_id = $1`, jobID,
-	).Scan(&status)
-	if err != nil && strings.Contains(err.Error(), "no rows") {
-		return ""
-	}
-	if err != nil {
-		t.Fatalf("query job_status: %v", err)
-	}
-	return status
-}
-
-// waitForStatus polls job_status until the given status is observed, or fails
-// the test if the context deadline is exceeded.
-func waitForStatus(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID, want string) {
+// waitForRunning polls GetJobStatus until the job is observed in "running"
+// state, or fails the test if the context deadline is exceeded.
+func waitForRunning(t *testing.T, rt *jobs.Runtime, jobID uuid.UUID) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	for {
-		got := queryJobStatus(t, pool, jobID)
-		if got == want {
+		result, err := rt.GetJobStatus(ctx, jobID)
+		if err == nil && result.Status == jobs.StatusRunning {
 			return
 		}
 		select {
 		case <-time.After(10 * time.Millisecond):
 		case <-ctx.Done():
-			t.Fatalf("job_status for %s: want %q, got %q (timeout)", jobID, want, got)
+			t.Fatalf("timeout waiting for job %s to reach running state", jobID)
 		}
 	}
 }
@@ -89,7 +71,7 @@ func TestJobStatus_Dispatch_Running(t *testing.T) {
 	}
 	defer close(block)
 
-	waitForStatus(t, pool, job.ID, jobs.StatusRunning)
+	waitForRunning(t, rt, job.ID)
 }
 
 // TestJobStatus_Run_Completed verifies that a successfully completed job has
@@ -126,9 +108,12 @@ func TestJobStatus_Run_Completed(t *testing.T) {
 		`SELECT id FROM jobs WHERE namespace = $1 AND idempotency_key = $2`, ns, "run-completed-1",
 	).Scan(&jobID)
 
-	got := queryJobStatus(t, pool, jobID)
-	if got != jobs.StatusCompleted {
-		t.Errorf("want status %q, got %q", jobs.StatusCompleted, got)
+	result, err := rt.GetJobStatus(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("GetJobStatus: %v", err)
+	}
+	if result.Status != jobs.StatusCompleted {
+		t.Errorf("want status %q, got %q", jobs.StatusCompleted, result.Status)
 	}
 	if dest.V != 99 {
 		t.Errorf("want response V=99, got V=%d", dest.V)
@@ -162,7 +147,13 @@ func TestJobStatus_PermanentFailure_Failed(t *testing.T) {
 		t.Fatalf("Dispatch: %v", err)
 	}
 
-	waitForStatus(t, pool, job.ID, jobs.StatusFailed)
+	success, err := rt.WaitForCompletion(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("WaitForCompletion: %v", err)
+	}
+	if success {
+		t.Errorf("expected job to fail, got success")
+	}
 }
 
 // TestJobStatus_ClaimLoop_Running verifies that when the claim loop picks up a
@@ -201,7 +192,7 @@ func TestJobStatus_ClaimLoop_Running(t *testing.T) {
 	}
 	defer close(block)
 
-	waitForStatus(t, pool, job.ID, jobs.StatusRunning)
+	waitForRunning(t, rt, job.ID)
 }
 
 // TestJobStatus_ValidationFailure_Failed verifies that when the claim loop
@@ -246,9 +237,12 @@ func TestJobStatus_ValidationFailure_Failed(t *testing.T) {
 	rt.Stop()
 
 	// job_status should be "failed" (set by handleValidationError).
-	got := queryJobStatus(t, pool, job.ID)
-	if got != jobs.StatusFailed {
-		t.Errorf("want status %q, got %q", jobs.StatusFailed, got)
+	result, err := rt.GetJobStatus(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("GetJobStatus: %v", err)
+	}
+	if result.Status != jobs.StatusFailed {
+		t.Errorf("want status %q, got %q", jobs.StatusFailed, result.Status)
 	}
 }
 
@@ -262,7 +256,9 @@ func TestAPI_HandleJobStatus_NotFound(t *testing.T) {
 	pool := testPool(t)
 	applyMigrationsPool(t, pool)
 
-	api := jobs.NewAPI(pool)
+	ls := leasestest.New()
+	rt := jobs.NewRuntime(pool, ls, jobs.Config{})
+	api := jobs.NewAPI(rt)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -281,7 +277,9 @@ func TestAPI_HandleJobStatus_InvalidID(t *testing.T) {
 	pool := testPool(t)
 	applyMigrationsPool(t, pool)
 
-	api := jobs.NewAPI(pool)
+	ls := leasestest.New()
+	rt := jobs.NewRuntime(pool, ls, jobs.Config{})
+	api := jobs.NewAPI(rt)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -328,7 +326,7 @@ func TestAPI_HandleJobStatus_OK(t *testing.T) {
 		`SELECT id FROM jobs WHERE namespace = $1 AND idempotency_key = $2`, ns, "api-ok-1",
 	).Scan(&jobID)
 
-	api := jobs.NewAPI(pool)
+	api := jobs.NewAPI(rt)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

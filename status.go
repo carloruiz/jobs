@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -32,11 +33,55 @@ func upsertJobStatus(ctx context.Context, q DB, jobID uuid.UUID, status string) 
 	return err
 }
 
-// jobStatusResponse is the JSON body returned by GET /api/v1/jobs/:id/status.
-type jobStatusResponse struct {
+// JobStatusResult holds the current status of a job, returned by GetJobStatus
+// and by the HTTP status endpoint.
+type JobStatusResult struct {
 	JobID     uuid.UUID `json:"job_id"`
 	Status    string    `json:"status"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// GetJobStatus fetches the current status of a job from the job_status table.
+// Returns nil, pgx.ErrNoRows if the job has no status row yet (not yet claimed).
+func (r *Runtime) GetJobStatus(ctx context.Context, jobID uuid.UUID) (*JobStatusResult, error) {
+	var result JobStatusResult
+	result.JobID = jobID
+	err := r.db.QueryRow(ctx,
+		`SELECT status, updated_at FROM job_status WHERE job_id = $1`, jobID,
+	).Scan(&result.Status, &result.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// WaitForCompletion polls job_status until the job reaches a terminal state
+// (completed or failed) or the context is cancelled.
+// Returns (true, nil) if the job completed successfully, (false, nil) if the
+// job failed, and (false, err) if the context expires or a DB error occurs.
+func (r *Runtime) WaitForCompletion(ctx context.Context, jobID uuid.UUID) (bool, error) {
+	ticker := time.NewTicker(r.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-ticker.C:
+			result, err := r.GetJobStatus(ctx, jobID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return false, fmt.Errorf("poll status: %w", err)
+			}
+			switch result.Status {
+			case StatusCompleted:
+				return true, nil
+			case StatusFailed:
+				return false, nil
+			}
+		}
+	}
 }
 
 // API exposes the HTTP management endpoints for the job system.
@@ -44,12 +89,12 @@ type jobStatusResponse struct {
 //
 // TODO(PR 7): add cancel, retry, and full job-detail endpoints.
 type API struct {
-	db DB
+	rt *Runtime
 }
 
-// NewAPI constructs an API backed by the given DB handle.
-func NewAPI(db DB) *API {
-	return &API{db: db}
+// NewAPI constructs an API backed by the given Runtime.
+func NewAPI(rt *Runtime) *API {
+	return &API{rt: rt}
 }
 
 // RegisterRoutes registers all management API routes on mux.
@@ -68,11 +113,7 @@ func (api *API) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var resp jobStatusResponse
-	resp.JobID = id
-	err = api.db.QueryRow(r.Context(),
-		`SELECT status, updated_at FROM job_status WHERE job_id = $1`, id,
-	).Scan(&resp.Status, &resp.UpdatedAt)
+	result, err := api.rt.GetJobStatus(r.Context(), id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -83,5 +124,5 @@ func (api *API) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(result)
 }
