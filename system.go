@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/carloruiz/leases"
@@ -39,6 +40,9 @@ type Config struct {
 	// Defaults to 2s if zero.
 	// TODO(PR 6): replaced by statusPoller which batches all active subscriptions.
 	PollInterval time.Duration
+	// HeartbeatInterval controls how often the heartbeat loop renews active leases.
+	// Defaults to 10s if zero.
+	HeartbeatInterval time.Duration
 	// BatchSize is the maximum number of jobs claimed per poll cycle.
 	// Defaults to 10 if zero.
 	BatchSize int
@@ -53,20 +57,29 @@ type registeredJob struct {
 	config  JobConfig
 }
 
+// activeJob holds the per-job state needed for heartbeating and cancellation.
+type activeJob struct {
+	cancel context.CancelFunc
+	token  leases.LeaseToken
+}
+
 // Runtime is the top-level struct that handles both dispatching and executing
 // jobs. Namespace is a system-wide configuration set at startup.
 //
-// TODO(PR 4): add activeJobs map for heartbeat tracking.
 // TODO(PR 6): add statusPoller for batched completion polling.
 type Runtime struct {
-	namespace    string
-	db           DB
-	leases       leases.Store
-	registry     map[string]registeredJob
-	buildSHA     string
-	pollInterval time.Duration
+	namespace      string
+	db             DB
+	leases         leases.Store
+	registry       map[string]registeredJob
+	buildSHA       string
+	pollInterval   time.Duration
 	claimBatchSize int
 	stopCh         chan struct{}
+
+	heartbeatInterval time.Duration
+	mu                sync.Mutex
+	activeJobs        map[string]*activeJob
 }
 
 // NewRuntime constructs a Runtime with the given database, lease store, and config.
@@ -75,19 +88,25 @@ func NewRuntime(db DB, ls leases.Store, cfg Config) *Runtime {
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
+	hbInterval := cfg.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = 10 * time.Second
+	}
 	batchSize := cfg.BatchSize
 	if batchSize <= 0 {
 		batchSize = 10
 	}
 	return &Runtime{
-		namespace:    cfg.Namespace,
-		db:           db,
-		leases:       ls,
-		registry:     make(map[string]registeredJob),
-		buildSHA:     cfg.BuildSHA,
-		pollInterval: pollInterval,
-		claimBatchSize: batchSize,
-		stopCh:       make(chan struct{}),
+		namespace:         cfg.Namespace,
+		db:                db,
+		leases:            ls,
+		registry:          make(map[string]registeredJob),
+		buildSHA:          cfg.BuildSHA,
+		pollInterval:      pollInterval,
+		heartbeatInterval: hbInterval,
+		claimBatchSize:    batchSize,
+		stopCh:            make(chan struct{}),
+		activeJobs:        make(map[string]*activeJob),
 	}
 }
 
@@ -110,7 +129,6 @@ func Register[Req, Resp any](r *Runtime, name string, cfg JobConfig, fn func(ctx
 // Pass "" for idempotencyKey to auto-generate a UUID and opt out of
 // deduplication — safe for fire-and-forget callers that do not retry.
 //
-// TODO(PR 3): register goroutine in activeJobs for heartbeat and cancellation.
 // TODO(PR 7): use extractContext(ctx) to propagate caller context fields.
 func (r *Runtime) Dispatch(
 	ctx context.Context, db DB, name string, req any, idempotencyKey string,
@@ -199,7 +217,6 @@ func (r *Runtime) Dispatch(
 // result of the existing execution rather than launching a duplicate.
 // dest is a pointer to the response type; the result is unmarshaled into it.
 //
-// TODO(PR 3): register in activeJobs for heartbeat and cancellation.
 // TODO(PR 7): use extractContext(ctx) to propagate caller context fields.
 func (r *Runtime) Run(
 	ctx context.Context, db DB, name string, req any, idempotencyKey string, dest any,
@@ -339,9 +356,14 @@ func (r *Runtime) pollForResult(ctx context.Context, jobID uuid.UUID) (json.RawM
 // The lease is held for the full retry loop: deleted on success or permanent
 // failure, released on context cancellation (graceful termination).
 //
-// TODO(PR 3): register/deregister in activeJobs for heartbeat tracking.
 // TODO(PR 8): integrate with graceful shutdown WaitGroup.
 func (r *Runtime) runWithRetry(ctx context.Context, db DB, job *Job, attempt *Attempt) (json.RawMessage, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	r.registerActiveJob(job.ID, cancel, attempt.LeaseToken)
+	defer r.deregisterActiveJob(job.ID)
+
 	for {
 		resp, execErr := r.registry[job.Name].handler.Handle(ctx, attempt.Request)
 		if execErr == nil {

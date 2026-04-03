@@ -18,14 +18,14 @@ type claimedJob struct {
 	attempt *Attempt
 }
 
-// Start launches the background claim loop. It polls for available jobs at
-// Config.PollInterval and executes each in a goroutine. Start is
-// non-blocking; call Stop to terminate the loop.
+// Start launches the background claim loop and heartbeat loop. Both poll at
+// Config.PollInterval and Config.HeartbeatInterval respectively. Start is
+// non-blocking; call Stop to terminate both loops.
 //
-// TODO(PR 4): start heartbeat loop alongside the claim loop.
 // TODO(PR 8): drain in-flight goroutines on shutdown.
 func (r *Runtime) Start(ctx context.Context) {
 	go r.claimLoop(ctx)
+	go r.heartbeatLoop(ctx)
 }
 
 // Stop signals the background claim loop to exit. Safe to call multiple times.
@@ -55,7 +55,6 @@ func (r *Runtime) claimLoop(ctx context.Context) {
 			}
 			for _, cj := range claimed {
 				cj := cj
-				// TODO(PR 4): register in activeJobs before launching.
 				go r.runWithRetry(ctx, r.db, cj.job, cj.attempt)
 			}
 		}
