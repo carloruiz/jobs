@@ -313,11 +313,21 @@ func (r *Runtime) Run(
 // pollForResult blocks until the job completes then fetches the response
 // payload. Used by Run() when a duplicate idempotency key is detected.
 func (r *Runtime) pollForResult(ctx context.Context, jobID uuid.UUID) (json.RawMessage, error) {
-	ok, err := r.WaitForCompletion(ctx, jobID)
+	success, err := r.WaitForCompletion(ctx, jobID)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
+	if !success {
+		var errJSON []byte
+		if err := r.db.QueryRow(ctx,
+			`SELECT error FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1`,
+			jobID,
+		).Scan(&errJSON); err == nil {
+			var e struct{ Message string }
+			if json.Unmarshal(errJSON, &e) == nil && e.Message != "" {
+				return nil, fmt.Errorf("job %s permanently failed: %s", jobID, e.Message)
+			}
+		}
 		return nil, fmt.Errorf("job %s permanently failed", jobID)
 	}
 	var resp json.RawMessage
