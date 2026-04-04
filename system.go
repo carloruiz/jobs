@@ -310,34 +310,18 @@ func (r *Runtime) Run(
 	return json.Unmarshal(resultRaw, dest)
 }
 
-// pollForCompletion blocks until the job reaches a terminal state (completed
-// or failed) by subscribing to the single shared statusPoller. Returns nil on
-// success and a descriptive error on failure or context cancellation.
-func (r *Runtime) pollForCompletion(ctx context.Context, jobID uuid.UUID) error {
-	ch, cancel := r.poller.Subscribe(jobID)
-	defer cancel()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case result := <-ch:
-		if result.err != nil {
-			return fmt.Errorf("poll status: %w", result.err)
-		}
-		if result.status == StatusFailed {
-			return fmt.Errorf("job %s permanently failed", jobID)
-		}
-		return nil
-	}
-}
-
 // pollForResult blocks until the job completes then fetches the response
 // payload. Used by Run() when a duplicate idempotency key is detected.
 func (r *Runtime) pollForResult(ctx context.Context, jobID uuid.UUID) (json.RawMessage, error) {
-	if err := r.pollForCompletion(ctx, jobID); err != nil {
+	ok, err := r.WaitForCompletion(ctx, jobID)
+	if err != nil {
 		return nil, err
 	}
+	if !ok {
+		return nil, fmt.Errorf("job %s permanently failed", jobID)
+	}
 	var resp json.RawMessage
-	err := r.db.QueryRow(ctx,
+	err = r.db.QueryRow(ctx,
 		`SELECT response FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1`,
 		jobID,
 	).Scan(&resp)

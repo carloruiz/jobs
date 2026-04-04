@@ -8,6 +8,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// runWithLock acquires mu, runs fn, then releases mu via defer. The error
+// returned by fn is passed through to the caller. Use this helper wherever a
+// lock must be held for the duration of a critical section.
+func runWithLock(mu sync.Locker, fn func() error) error {
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
+}
+
 // pollerResult is delivered to a subscriber when its job reaches a terminal
 // state. err is non-nil only when the poller encounters a DB error that
 // prevents it from fanning out a status result.
@@ -51,36 +60,48 @@ func newStatusPoller(db DB, namespace string, interval time.Duration) *statusPol
 }
 
 // Subscribe registers jobID for polling and returns:
-//   - ch: a buffered channel that receives exactly one pollerResult when the
-//     job reaches a terminal state (completed or failed).
+//   - ch: a receive-only buffered channel that delivers exactly one pollerResult
+//     when the job reaches a terminal state (completed or failed). The channel
+//     is owned by the poller — callers must never close it. Because it is typed
+//     as <-chan pollerResult (receive-only), the compiler enforces this: only
+//     the statusPoller, which holds the underlying bidirectional channel, is
+//     able to close or send on it.
 //   - cancel: a function to deregister the subscription; always defer it.
 //
 // Subscribe starts the background goroutine on the first call.
 func (p *statusPoller) Subscribe(jobID uuid.UUID) (<-chan pollerResult, func()) {
 	sub := &pollerSub{ch: make(chan pollerResult, 1)}
 
-	p.mu.Lock()
-	p.subs[jobID] = append(p.subs[jobID], sub)
-	p.mu.Unlock()
+	_ = runWithLock(&p.mu, func() error {
+		p.subs[jobID] = append(p.subs[jobID], sub)
+		return nil
+	})
 
 	// Start the background goroutine exactly once.
 	p.startOnce.Do(func() { go p.run() })
 
 	cancel := func() {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		subs := p.subs[jobID]
-		for i, s := range subs {
-			if s == sub {
-				last := len(subs) - 1
-				subs[i] = subs[last]
-				p.subs[jobID] = subs[:last]
-				if len(p.subs[jobID]) == 0 {
-					delete(p.subs, jobID)
+		_ = runWithLock(&p.mu, func() error {
+			subs := p.subs[jobID]
+			for i, s := range subs {
+				if s == sub {
+					last := len(subs) - 1
+					subs[i] = subs[last]
+					p.subs[jobID] = subs[:last]
+					if len(p.subs[jobID]) == 0 {
+						delete(p.subs, jobID)
+					}
+					// The channel is not closed here: the subscriber selects
+					// on ctx.Done() alongside ch, so it will never block
+					// indefinitely. The channel is buffered (size 1) and, once
+					// removed from the map, will be garbage-collected when the
+					// subscriber's goroutine exits and drops its reference.
+					return nil
 				}
-				return
 			}
-		}
+			// Sub not found: tick() already fanned out and removed it.
+			return nil
+		})
 	}
 	return sub.ch, cancel
 }
@@ -111,16 +132,20 @@ func (p *statusPoller) run() {
 // tick performs a single batched poll: one DB query for all subscribed job
 // IDs, then fans out terminal results to the waiting subscribers.
 func (p *statusPoller) tick() {
-	p.mu.Lock()
-	if len(p.subs) == 0 {
-		p.mu.Unlock()
+	var jobIDs []uuid.UUID
+	_ = runWithLock(&p.mu, func() error {
+		if len(p.subs) == 0 {
+			return nil
+		}
+		jobIDs = make([]uuid.UUID, 0, len(p.subs))
+		for id := range p.subs {
+			jobIDs = append(jobIDs, id)
+		}
+		return nil
+	})
+	if len(jobIDs) == 0 {
 		return
 	}
-	jobIDs := make([]uuid.UUID, 0, len(p.subs))
-	for id := range p.subs {
-		jobIDs = append(jobIDs, id)
-	}
-	p.mu.Unlock()
 
 	rows, err := p.db.Query(context.Background(),
 		`SELECT job_id, status FROM job_status
@@ -151,16 +176,21 @@ func (p *statusPoller) tick() {
 		return
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for id, status := range terminalByID {
-		result := pollerResult{status: status}
-		for _, sub := range p.subs[id] {
-			select {
-			case sub.ch <- result:
-			default:
+	_ = runWithLock(&p.mu, func() error {
+		for id, status := range terminalByID {
+			result := pollerResult{status: status}
+			for _, sub := range p.subs[id] {
+				// Send the result then close so the subscriber's channel
+				// read always unblocks. The send is non-blocking only as a
+				// safety net; in normal flow the buffered channel is empty.
+				select {
+				case sub.ch <- result:
+					close(sub.ch)
+				default:
+				}
 			}
+			delete(p.subs, id)
 		}
-		delete(p.subs, id)
-	}
+		return nil
+	})
 }
