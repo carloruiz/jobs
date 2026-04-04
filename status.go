@@ -56,32 +56,22 @@ func (r *Runtime) GetJobStatus(ctx context.Context, jobID uuid.UUID) (*JobStatus
 	return &result, nil
 }
 
-// WaitForCompletion polls job_status until the job reaches a terminal state
-// (completed or failed) or the context is cancelled.
-// Returns (true, nil) if the job completed successfully, (false, nil) if the
-// job failed, and (false, err) if the context expires or a DB error occurs.
+// WaitForCompletion blocks until the job reaches a terminal state (completed
+// or failed) or the context is cancelled. Uses the shared statusPoller so
+// that N concurrent callers issue only 1 DB query per poll interval.
+// Returns (true, nil) on success, (false, nil) on permanent failure, and
+// (false, err) if the context expires or a DB error occurs.
 func (r *Runtime) WaitForCompletion(ctx context.Context, jobID uuid.UUID) (bool, error) {
-	ticker := time.NewTicker(r.pollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-ticker.C:
-			result, err := r.GetJobStatus(ctx, jobID)
-			if errors.Is(err, pgx.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return false, fmt.Errorf("poll status: %w", err)
-			}
-			switch result.Status {
-			case StatusCompleted:
-				return true, nil
-			case StatusFailed:
-				return false, nil
-			}
+	ch, cancel := r.poller.Subscribe(jobID)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case result := <-ch:
+		if result.err != nil {
+			return false, fmt.Errorf("poll status: %w", result.err)
 		}
+		return result.status == StatusCompleted, nil
 	}
 }
 
